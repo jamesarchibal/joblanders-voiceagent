@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Voice samples / recordings (large binaries, not source)
+voice-samples/
+*.m4a
+*.mp3
+*.wav
+
+# Logs
+worker.log
+*.log
+
+# Google Drive / macOS cruft
+.DS_Store
+*.gdoc
