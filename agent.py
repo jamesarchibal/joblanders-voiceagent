@@ -78,6 +78,20 @@ DEFAULTS = {
 }
 
 
+def _format_history_es(chat_ctx) -> str:
+    """Render the caller conversation as 'Llamante:' / 'Lander:' lines (Spanish labels)."""
+    lines: list[str] = []
+    try:
+        for msg in chat_ctx.messages():
+            if msg.role not in ("user", "assistant") or not msg.text_content:
+                continue
+            who = "Llamante" if msg.role == "user" else "Lander"
+            lines.append(f"{who}: {msg.text_content}")
+    except Exception:  # noqa: BLE001 — never let history formatting break a transfer
+        return ""
+    return "\n".join(lines)
+
+
 class LanderAgent(Agent):
     def __init__(self, instructions: str, knowledge: list[dict] | None = None) -> None:
         super().__init__(instructions=instructions)
@@ -102,23 +116,64 @@ class LanderAgent(Agent):
         """
         self.branch = "humano" if department not in ("ventas", "soporte") else department
         print(f"[TRANSFER] -> {department} | summary: {summary}")
+
+        # Conversación previa con el llamante, para que el humano tenga contexto real.
+        history = _format_history_es(self.chat_ctx)
+        history_block = history or (
+            "(No ha habido conversación de fondo: el llamante solo ha pedido hablar con una persona.)"
+        )
+
+        # Guion del agente-susurro (el que habla con el HUMANO antes de unir las llamadas).
+        # Pasamos `instructions` como str => reemplaza la plantilla por defecto, así que el
+        # historial va embebido aquí (la plantilla built-in no se aplica).
+        whisper_instructions = (
+            "Eres Lander, el asistente de voz de Joblanders. Acabas de atender una llamada y "
+            "la persona ha pedido hablar con un humano. AHORA hablas por teléfono con esa "
+            "persona del equipo (el humano), NO con el llamante: el llamante NO te oye. "
+            "Frases cortas, tono natural, como una persona al teléfono.\n\n"
+            f"Departamento: {department}.\n"
+            f"Resumen en una frase: {summary}.\n\n"
+            "Conversación previa con el llamante:\n"
+            f"{history_block}\n\n"
+            "Actúa en este orden:\n"
+            "1. Salúdale y dile en una frase que tienes una llamada para pasarle.\n"
+            "2. Resúmele de qué ha hablado el llamante. Si no ha habido conversación real "
+            "(solo quiere hablar con una persona), dilo claramente: no me ha contado nada, "
+            "solo quiere hablar con alguien.\n"
+            "3. Pídele permiso para pasarle la llamada.\n"
+            "4. Si dice que SÍ: llama a la herramienta connect_to_caller para unir las "
+            "llamadas (tú te retiras y cuelgas).\n"
+            "5. Si dice que NO: pregúntale por qué o qué mensaje quiere que le dé al llamante. "
+            "Cuando te lo diga, llama a decline_transfer con ese motivo como argumento. Si no "
+            "da ningún motivo, usa decline_transfer con 'ocupado, que llame más tarde'."
+        )
+
         # Real warm transfer: dial the human over the netelip SIP outbound trunk, play
-        # hold music to the caller, whisper them a summary, then merge the two calls.
-        # Awaiting the task returns on success or RAISES on no-answer/voicemail/declined.
+        # hold music to the caller, whisper them the summary, then merge the two calls.
+        # Awaiting the task returns on success or RAISES on no-answer/voicemail/decline.
         try:
             await WarmTransferTask(
                 sip_call_to=TRANSFER_NUMBER,
                 sip_trunk_id=OUTBOUND_TRUNK,
                 ringing_timeout=30,
                 chat_ctx=self.chat_ctx,
-                extra_instructions=(
-                    f"Departamento: {department}. El caso, en una frase: {summary}. "
-                    "Resume en español, con naturalidad, para que la persona no tenga que "
-                    "preguntar de nuevo."
-                ),
+                instructions=whisper_instructions,
             )
         except Exception as exc:  # noqa: BLE001 — no contestan / buzón / rechazo / error SIP
+            msg = str(exc)
             print(f"[TRANSFER] failed: {exc!r}")
+            if "declined to connect" in msg:
+                reason = msg.split("declined to connect:", 1)[-1].strip() or "está ocupado"
+                return (
+                    f"La persona no puede atenderte ahora. Motivo: {reason}. Trasládaselo al "
+                    "llamante con tacto en una frase, discúlpate, y ofrece tomar sus datos para "
+                    "devolverle la llamada o seguir ayudando tú."
+                )
+            if "voicemail" in msg:
+                return (
+                    "Ha saltado el buzón de voz. Dilo en una frase, discúlpate y ofrece seguir "
+                    "ayudando tú o tomar sus datos para devolverle la llamada."
+                )
             return (
                 "La transferencia no ha salido (ahora mismo no contestan). Discúlpate en una "
                 "frase y ofrece seguir ayudando tú o tomar sus datos para devolverle la llamada."
