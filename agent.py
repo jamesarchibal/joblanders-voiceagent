@@ -179,19 +179,26 @@ class LanderAgent(Agent):
                 "La transferencia no ha salido (ahora mismo no contestan). Discúlpate en una "
                 "frase y ofrece seguir ayudando tú o tomar sus datos para devolverle la llamada."
             )
-        # Éxito: la persona y el llamante ya están unidos. El agente debe SALIR de la
-        # llamada (si no, se queda ahí de oyente). Cerramos la sesión del agente en
-        # segundo plano: la sala NO se borra (delete_room_on_close=False por defecto),
-        # así que llamante + humano siguen hablando; solo se desconecta la IA.
+        # Éxito: la persona y el llamante ya están unidos. Flujo de cierre: el agente
+        # dice UNA frase breve de despedida a ambos y SALE de la llamada (si no, se
+        # queda ahí de oyente). El texto devuelto abajo es lo que el LLM convierte en
+        # esa despedida (una sola voz, sin doble reply). Luego cerramos la sesión: la
+        # sala NO se borra (delete_room_on_close=False por defecto), así que llamante +
+        # humano siguen hablando; solo se desconecta la IA.
         session = context.session
 
         async def _leave_call() -> None:
-            await asyncio.sleep(0.3)  # deja asentar la fusión
+            # Margen para que termine la despedida antes de colgar (frase corta ~2-3s).
+            await asyncio.sleep(4.0)
             with contextlib.suppress(Exception):
-                await session.aclose()
+                await session.aclose()  # el agente cuelga; la llamada sigue entre ellos
 
         asyncio.create_task(_leave_call())
-        return "Ya está con una persona del equipo. No digas nada más."
+        return (
+            "Hecho: ya están conectados. Di UNA sola frase muy corta y cálida avisando "
+            "de que les dejas conectados y despidiéndote (p.ej. 'os dejo conectados, "
+            "¡que vaya muy bien!'). No hagas preguntas ni añadas nada más."
+        )
 
     # --- Sales: product/plan facts ------------------------------------------
     @function_tool
