@@ -15,6 +15,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from datetime import datetime, timezone
@@ -178,8 +179,19 @@ class LanderAgent(Agent):
                 "La transferencia no ha salido (ahora mismo no contestan). Discúlpate en una "
                 "frase y ofrece seguir ayudando tú o tomar sus datos para devolverle la llamada."
             )
-        # Éxito: el llamante ya está con una persona. No hables por encima de ellos.
-        return "Ya está con una persona del equipo. Cierra tu intervención sin añadir nada más."
+        # Éxito: la persona y el llamante ya están unidos. El agente debe SALIR de la
+        # llamada (si no, se queda ahí de oyente). Cerramos la sesión del agente en
+        # segundo plano: la sala NO se borra (delete_room_on_close=False por defecto),
+        # así que llamante + humano siguen hablando; solo se desconecta la IA.
+        session = context.session
+
+        async def _leave_call() -> None:
+            await asyncio.sleep(0.3)  # deja asentar la fusión
+            with contextlib.suppress(Exception):
+                await session.aclose()
+
+        asyncio.create_task(_leave_call())
+        return "Ya está con una persona del equipo. No digas nada más."
 
     # --- Sales: product/plan facts ------------------------------------------
     @function_tool
