@@ -93,6 +93,35 @@ def _format_history_es(chat_ctx) -> str:
     return "\n".join(lines)
 
 
+# Guion del agente-susurro (lo que Lander le dice al HUMANO antes de unir las llamadas).
+# Editable desde el dashboard (LanderOS → Traspaso, key `transfer_script` en Supabase);
+# si no hay nada guardado se usa este texto. Tokens que se sustituyen en tiempo real:
+#   {{department}} → "ventas" | "soporte"
+#   {{summary}}    → resumen en una frase del caso
+#   {{history}}    → conversación previa con el llamante (o aviso de que no la hubo)
+DEFAULT_TRANSFER_SCRIPT = (
+    "Eres Lander, el asistente de voz de Joblanders. Acabas de atender una llamada y "
+    "la persona ha pedido hablar con un humano. AHORA hablas por teléfono con esa "
+    "persona del equipo (el humano), NO con el llamante: el llamante NO te oye. "
+    "Frases cortas, tono natural, como una persona al teléfono.\n\n"
+    "Departamento: {{department}}.\n"
+    "Resumen en una frase: {{summary}}.\n\n"
+    "Conversación previa con el llamante:\n"
+    "{{history}}\n\n"
+    "Actúa en este orden:\n"
+    "1. Salúdale y dile en una frase que tienes una llamada para pasarle.\n"
+    "2. Resúmele de qué ha hablado el llamante. Si no ha habido conversación real "
+    "(solo quiere hablar con una persona), dilo claramente: no me ha contado nada, "
+    "solo quiere hablar con alguien.\n"
+    "3. Pídele permiso para pasarle la llamada.\n"
+    "4. Si dice que SÍ: llama a la herramienta connect_to_caller para unir las "
+    "llamadas (tú te retiras y cuelgas).\n"
+    "5. Si dice que NO: pregúntale por qué o qué mensaje quiere que le dé al llamante. "
+    "Cuando te lo diga, llama a decline_transfer con ese motivo como argumento. Si no "
+    "da ningún motivo, usa decline_transfer con 'ocupado, que llame más tarde'."
+)
+
+
 class _LanderWarmTransfer(WarmTransferTask):
     """WarmTransferTask que avisa al LLAMANTE antes de unir las llamadas.
 
@@ -122,10 +151,17 @@ class _LanderWarmTransfer(WarmTransferTask):
 
 
 class LanderAgent(Agent):
-    def __init__(self, instructions: str, knowledge: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        instructions: str,
+        knowledge: list[dict] | None = None,
+        transfer_script: str | None = None,
+    ) -> None:
         super().__init__(instructions=instructions)
         # Optional per-call knowledge from the dashboard; falls back to knowledge.py.
         self._knowledge = knowledge or []
+        # Guion del traspaso editable desde el dashboard; si no, el default de arriba.
+        self._transfer_script = transfer_script or DEFAULT_TRANSFER_SCRIPT
         # Detected branch for the call log; set when a transfer happens.
         self.branch: str | None = None
 
@@ -153,28 +189,14 @@ class LanderAgent(Agent):
         )
 
         # Guion del agente-susurro (el que habla con el HUMANO antes de unir las llamadas).
-        # Pasamos `instructions` como str => reemplaza la plantilla por defecto, así que el
-        # historial va embebido aquí (la plantilla built-in no se aplica).
+        # Plantilla editable desde el dashboard (self._transfer_script); sustituimos los
+        # tokens {{department}}/{{summary}}/{{history}} con .replace (robusto ante llaves
+        # sueltas que el usuario pueda escribir, a diferencia de str.format).
         whisper_instructions = (
-            "Eres Lander, el asistente de voz de Joblanders. Acabas de atender una llamada y "
-            "la persona ha pedido hablar con un humano. AHORA hablas por teléfono con esa "
-            "persona del equipo (el humano), NO con el llamante: el llamante NO te oye. "
-            "Frases cortas, tono natural, como una persona al teléfono.\n\n"
-            f"Departamento: {department}.\n"
-            f"Resumen en una frase: {summary}.\n\n"
-            "Conversación previa con el llamante:\n"
-            f"{history_block}\n\n"
-            "Actúa en este orden:\n"
-            "1. Salúdale y dile en una frase que tienes una llamada para pasarle.\n"
-            "2. Resúmele de qué ha hablado el llamante. Si no ha habido conversación real "
-            "(solo quiere hablar con una persona), dilo claramente: no me ha contado nada, "
-            "solo quiere hablar con alguien.\n"
-            "3. Pídele permiso para pasarle la llamada.\n"
-            "4. Si dice que SÍ: llama a la herramienta connect_to_caller para unir las "
-            "llamadas (tú te retiras y cuelgas).\n"
-            "5. Si dice que NO: pregúntale por qué o qué mensaje quiere que le dé al llamante. "
-            "Cuando te lo diga, llama a decline_transfer con ese motivo como argumento. Si no "
-            "da ningún motivo, usa decline_transfer con 'ocupado, que llame más tarde'."
+            self._transfer_script
+            .replace("{{department}}", department)
+            .replace("{{summary}}", summary)
+            .replace("{{history}}", history_block)
         )
 
         # Real warm transfer: dial the human over the netelip SIP outbound trunk, play
@@ -339,7 +361,11 @@ async def entrypoint(ctx: JobContext) -> None:
         min_endpointing_delay=p("MIN_ENDPOINTING_DELAY"),
     )
 
-    agent = LanderAgent(instructions=instructions, knowledge=cfg.knowledge)
+    agent = LanderAgent(
+        instructions=instructions,
+        knowledge=cfg.knowledge,
+        transfer_script=cfg.transfer_script,
+    )
 
     # --- Multilingüe: cambia a la voz clonada del idioma del llamante ----------
     # Deepgram (multi) detecta el idioma de cada turno; si es catalán o inglés,
