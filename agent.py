@@ -93,6 +93,34 @@ def _format_history_es(chat_ctx) -> str:
     return "\n".join(lines)
 
 
+class _LanderWarmTransfer(WarmTransferTask):
+    """WarmTransferTask que avisa al LLAMANTE antes de unir las llamadas.
+
+    La tarea de fábrica mantiene al llamante en espera (IO desactivada) hasta que
+    hace el merge en un solo paso, así que el llamante nunca se entera de que le
+    van a pasar. James quiere que AMBAS partes estén avisadas: al humano le avisa
+    el agente-susurro (dice que sí = está avisado), y aquí, justo antes del merge,
+    avisamos al llamante.
+    """
+
+    async def _merge_calls(self) -> None:
+        # Paramos la música de espera y reactivamos el audio del llamante para que
+        # nos oiga (el merge posterior y _set_result vuelven a hacerlo, es idempotente).
+        if self._hold_audio_handle:
+            self._hold_audio_handle.stop()
+            self._hold_audio_handle = None
+        self._set_io_enabled(True)
+        with contextlib.suppress(Exception):
+            await self.session.generate_reply(
+                instructions=(
+                    "Avisa al llamante en UNA sola frase corta y cálida: le pasas "
+                    "ahora mismo con una persona del equipo. No hagas preguntas ni "
+                    "añadas nada más."
+                )
+            )
+        await super()._merge_calls()
+
+
 class LanderAgent(Agent):
     def __init__(self, instructions: str, knowledge: list[dict] | None = None) -> None:
         super().__init__(instructions=instructions)
@@ -153,7 +181,7 @@ class LanderAgent(Agent):
         # hold music to the caller, whisper them the summary, then merge the two calls.
         # Awaiting the task returns on success or RAISES on no-answer/voicemail/decline.
         try:
-            await WarmTransferTask(
+            await _LanderWarmTransfer(
                 sip_call_to=TRANSFER_NUMBER,
                 sip_trunk_id=OUTBOUND_TRUNK,
                 ringing_timeout=30,
