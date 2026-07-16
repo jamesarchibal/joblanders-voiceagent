@@ -176,6 +176,21 @@ class LanderAgent(Agent):
 
 
 async def entrypoint(ctx: JobContext) -> None:
+    # WarmTransferTask spins its OWN whisper-agent session in a sub-room named
+    # "<caller_room>-human-agent" (it summarises the case to the human, then bridges).
+    # Our worker uses automatic dispatch, so LiveKit ALSO dispatches THIS entrypoint
+    # to that sub-room — which would run the normal greeting agent on top of the
+    # whisper agent, so the human hears "hola, soy Lander…" with zero transfer context
+    # (exactly the bug seen 2026-07-16). Skip those rooms: let WarmTransferTask own them.
+    room_name = ""
+    try:
+        room_name = (ctx.job.room.name if ctx.job and ctx.job.room else "") or ""
+    except Exception:
+        room_name = getattr(getattr(ctx, "room", None), "name", "") or ""
+    if room_name.endswith("-human-agent"):
+        print(f"[TRANSFER] skip auto-dispatch to warm-transfer sub-room {room_name!r}")
+        return
+
     # Read dashboard config (prompt / knowledge / params) once at call start.
     # Blocking stdlib HTTP read, so run it off the event loop. Never raises.
     cfg = await asyncio.to_thread(load_config)
