@@ -53,6 +53,11 @@ ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
 # language from the text Claude produces — Lander mirrors whatever language the caller uses
 # (ES / CA / EN / …). Set ELEVENLABS_LANGUAGE to a code (e.g. "es") only to force one language.
 TTS_LANGUAGE = os.getenv("ELEVENLABS_LANGUAGE") or None
+# Per-language cloned voices of James. Lander swaps to the matching clone when Deepgram
+# detects the caller speaking Catalan or English; any other language uses the ES clone.
+ELEVEN_VOICE_ID_CA = os.getenv("ELEVENLABS_VOICE_ID_CA") or "x5Jilxt6jZdQy7DBFXLh"
+ELEVEN_VOICE_ID_EN = os.getenv("ELEVENLABS_VOICE_ID_EN") or "sXhK0yDKboLJMlkKubg3"
+VOICE_BY_LANG = {"ca": ELEVEN_VOICE_ID_CA, "en": ELEVEN_VOICE_ID_EN}
 # Warm transfer: dial a human via the netelip SIP outbound trunk (created in LiveKit Cloud).
 OUTBOUND_TRUNK = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK") or "ST_sk7yUi8zGoGz"
 TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER") or "+34623004169"
@@ -194,11 +199,12 @@ async def entrypoint(ctx: JobContext) -> None:
         tts_kwargs["voice_id"] = ELEVEN_VOICE_ID
     if TTS_LANGUAGE:
         tts_kwargs["language"] = TTS_LANGUAGE
+    tts = elevenlabs.TTS(**tts_kwargs)
 
     session = AgentSession(
         stt=deepgram.STT(model=STT_MODEL, language="multi"),
         llm=anthropic.LLM(model=LLM_MODEL),
-        tts=elevenlabs.TTS(**tts_kwargs),
+        tts=tts,
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
         # Empezar a generar la respuesta en cuanto se detecta fin de turno (probable),
@@ -216,6 +222,25 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     agent = LanderAgent(instructions=instructions, knowledge=cfg.knowledge)
+
+    # --- Multilingüe: cambia a la voz clonada del idioma del llamante ----------
+    # Deepgram (multi) detecta el idioma de cada turno; si es catalán o inglés,
+    # usamos la voz clonada correspondiente; cualquier otro idioma usa la voz ES.
+    current_voice = {"id": ELEVEN_VOICE_ID}
+
+    @session.on("user_input_transcribed")
+    def _on_lang(ev) -> None:  # noqa: ANN001 (livekit event payload)
+        try:
+            if not getattr(ev, "is_final", False) or not getattr(ev, "language", None):
+                return
+            lang = str(ev.language).split("-")[0].lower()
+            vid = VOICE_BY_LANG.get(lang, ELEVEN_VOICE_ID)
+            if vid and vid != current_voice["id"]:
+                current_voice["id"] = vid
+                tts.update_options(voice_id=vid)
+                print(f"[VOICE] lang={lang} -> voice={vid}")
+        except Exception:  # noqa: BLE001 — nunca romper la llamada por esto
+            pass
 
     # --- Call log: capture transcript + write one row on shutdown -------------
     transcript: list[dict] = []
