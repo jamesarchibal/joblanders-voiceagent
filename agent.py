@@ -26,7 +26,6 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     RunContext,
-    TurnHandlingOptions,
     WorkerOptions,
     cli,
     function_tool,
@@ -207,9 +206,7 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=tts,
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
-        # Empezar a generar la respuesta en cuanto se detecta fin de turno (probable),
-        # para que Lander conteste antes y suene menos "robótico" por la latencia.
-        turn_handling=TurnHandlingOptions(preemptive_generation=True),
+        # (preemptive_generation ya viene activado por defecto → menos latencia.)
         # --- Anti-corte (barge-in) sobre línea telefónica con ruido -----------
         # Exigir voz real (duración + palabras) antes de dar por interrumpido a
         # Lander, y retomar la frase si la interrupción fue en falso.
