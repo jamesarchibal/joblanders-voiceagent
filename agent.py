@@ -31,6 +31,7 @@ from livekit.agents import (
     cli,
     function_tool,
 )
+from livekit.agents.beta.workflows import WarmTransferTask
 from livekit.plugins import anthropic, deepgram, elevenlabs, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -52,6 +53,9 @@ ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
 # language from the text Claude produces — Lander mirrors whatever language the caller uses
 # (ES / CA / EN / …). Set ELEVENLABS_LANGUAGE to a code (e.g. "es") only to force one language.
 TTS_LANGUAGE = os.getenv("ELEVENLABS_LANGUAGE") or None
+# Warm transfer: dial a human via the netelip SIP outbound trunk (created in LiveKit Cloud).
+OUTBOUND_TRUNK = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK") or "ST_sk7yUi8zGoGz"
+TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER") or "+34623004169"
 # Tuned to sound human, not robotic (turbo model + these settings, chosen by A/B on real samples):
 # lower stability = more natural intonation; high similarity = closer to the cloned voice; some style.
 # These are DEFAULTS; the dashboard (Parámetros tab) can override each at call start.
@@ -88,14 +92,31 @@ class LanderAgent(Agent):
                 human doesn't have to ask them to repeat. E.g. "Empresa interesada
                 en el plan para 15 vacantes, urgencia alta."
         """
-        # Milestone 2 will do a real SIP REFER + whisper summary here. For now we
-        # log the intent and tell the caller what's happening.
         self.branch = "humano" if department not in ("ventas", "soporte") else department
         print(f"[TRANSFER] -> {department} | summary: {summary}")
-        return (
-            f"Transferencia iniciada al equipo de {department}. Di al llamante en una "
-            "frase cálida que le pasas con una persona y que ya le has resumido el caso."
-        )
+        # Real warm transfer: dial the human over the netelip SIP outbound trunk, play
+        # hold music to the caller, whisper them a summary, then merge the two calls.
+        # Awaiting the task returns on success or RAISES on no-answer/voicemail/declined.
+        try:
+            await WarmTransferTask(
+                sip_call_to=TRANSFER_NUMBER,
+                sip_trunk_id=OUTBOUND_TRUNK,
+                ringing_timeout=30,
+                chat_ctx=self.chat_ctx,
+                extra_instructions=(
+                    f"Departamento: {department}. El caso, en una frase: {summary}. "
+                    "Resume en español, con naturalidad, para que la persona no tenga que "
+                    "preguntar de nuevo."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — no contestan / buzón / rechazo / error SIP
+            print(f"[TRANSFER] failed: {exc!r}")
+            return (
+                "La transferencia no ha salido (ahora mismo no contestan). Discúlpate en una "
+                "frase y ofrece seguir ayudando tú o tomar sus datos para devolverle la llamada."
+            )
+        # Éxito: el llamante ya está con una persona. No hables por encima de ellos.
+        return "Ya está con una persona del equipo. Cierra tu intervención sin añadir nada más."
 
     # --- Sales: product/plan facts ------------------------------------------
     @function_tool
