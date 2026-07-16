@@ -59,7 +59,11 @@ ELEVEN_VOICE_ID_EN = os.getenv("ELEVENLABS_VOICE_ID_EN") or "sXhK0yDKboLJMlkKubg
 VOICE_BY_LANG = {"ca": ELEVEN_VOICE_ID_CA, "en": ELEVEN_VOICE_ID_EN}
 # Warm transfer: dial a human via the netelip SIP outbound trunk (created in LiveKit Cloud).
 OUTBOUND_TRUNK = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK") or "ST_sk7yUi8zGoGz"
-TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER") or "+34623004169"
+# netelip rejects the E.164 "+" with a SIP 404; it wants the international "00" prefix
+# (e.g. +34623004169 -> 0034623004169). Normalise so config can still hold the "+" form.
+TRANSFER_NUMBER = (os.getenv("TRANSFER_NUMBER") or "+34623004169").strip()
+if TRANSFER_NUMBER.startswith("+"):
+    TRANSFER_NUMBER = "00" + TRANSFER_NUMBER[1:]
 # Tuned to sound human, not robotic (turbo model + these settings, chosen by A/B on real samples):
 # lower stability = more natural intonation; high similarity = closer to the cloned voice; some style.
 # These are DEFAULTS; the dashboard (Parámetros tab) can override each at call start.
