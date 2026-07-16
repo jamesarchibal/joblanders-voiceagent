@@ -14,25 +14,65 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentSession, JobContext, RunContext, WorkerOptions, cli, function_tool
-from livekit.plugins import anthropic, cartesia, deepgram, silero
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    RunContext,
+    TurnHandlingOptions,
+    WorkerOptions,
+    cli,
+    function_tool,
+)
+from livekit.plugins import anthropic, deepgram, elevenlabs, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+from calllog import save_call_log
+from config import load_config
 
 load_dotenv(override=True)
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "system_es.md"
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
 STT_MODEL = os.getenv("STT_MODEL", "nova-3")
-CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID") or None
+TTS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+# Cloned "James" voice. Hardcoded fallback so the agent NEVER silently falls back to a
+# default ElevenLabs voice if the secret is missing/empty.
+ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID") or "wEQE8Agx2GxUkKIOCNny"
+# The plugin looks for ELEVEN_API_KEY; we store it as ELEVENLABS_API_KEY, so pass it explicitly.
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
+# Multilingual: leave the TTS language UNSET so ElevenLabs (turbo_v2_5) auto-detects the
+# language from the text Claude produces — Lander mirrors whatever language the caller uses
+# (ES / CA / EN / …). Set ELEVENLABS_LANGUAGE to a code (e.g. "es") only to force one language.
+TTS_LANGUAGE = os.getenv("ELEVENLABS_LANGUAGE") or None
+# Tuned to sound human, not robotic (turbo model + these settings, chosen by A/B on real samples):
+# lower stability = more natural intonation; high similarity = closer to the cloned voice; some style.
+# These are DEFAULTS; the dashboard (Parámetros tab) can override each at call start.
+DEFAULTS = {
+    "ELEVENLABS_STABILITY": float(os.getenv("ELEVENLABS_STABILITY", "0.4")),
+    "ELEVENLABS_SIMILARITY": float(os.getenv("ELEVENLABS_SIMILARITY", "0.9")),
+    "ELEVENLABS_STYLE": float(os.getenv("ELEVENLABS_STYLE", "0.3")),
+    "MIN_INTERRUPTION_DURATION": float(os.getenv("MIN_INTERRUPTION_DURATION", "0.5")),
+    "MIN_INTERRUPTION_WORDS": float(os.getenv("MIN_INTERRUPTION_WORDS", "2")),
+    "FALSE_INTERRUPTION_TIMEOUT": float(os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0")),
+    "MIN_ENDPOINTING_DELAY": float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4")),
+}
 
 
 class LanderAgent(Agent):
-    def __init__(self) -> None:
-        super().__init__(instructions=PROMPT_PATH.read_text(encoding="utf-8"))
+    def __init__(self, instructions: str, knowledge: list[dict] | None = None) -> None:
+        super().__init__(instructions=instructions)
+        # Optional per-call knowledge from the dashboard; falls back to knowledge.py.
+        self._knowledge = knowledge or []
+        # Detected branch for the call log; set when a transfer happens.
+        self.branch: str | None = None
 
     # --- Escape hatch: warm transfer to a human -----------------------------
     @function_tool
@@ -50,6 +90,7 @@ class LanderAgent(Agent):
         """
         # Milestone 2 will do a real SIP REFER + whisper summary here. For now we
         # log the intent and tell the caller what's happening.
+        self.branch = "humano" if department not in ("ventas", "soporte") else department
         print(f"[TRANSFER] -> {department} | summary: {summary}")
         return (
             f"Transferencia iniciada al equipo de {department}. Di al llamante en una "
@@ -69,6 +110,22 @@ class LanderAgent(Agent):
             topic: What the caller asked about, e.g. "precio", "planes",
                 "cómo funciona el matching".
         """
+        # Prefer dashboard-managed knowledge (LanderOS → Knowledge tab): match the
+        # topic against the editable facts. Never quote a price sentinel.
+        topic_l = (topic or "").lower()
+        for fact in self._knowledge:
+            hay = f"{fact.get('topic', '')} {fact.get('id', '')}".lower()
+            if any(w and w in hay for w in topic_l.split()):
+                answer = str(fact.get("answer", ""))
+                if "PENDIENTE_DEFINIR" in answer:
+                    return {
+                        "found": False,
+                        "reason": "not_public",
+                        "say": answer.split("—", 1)[-1].strip() or answer,
+                    }
+                return {"found": True, "topic": fact.get("topic"), "answer": answer}
+
+        # Fallback to the baked-in knowledge module.
         from knowledge import get_product_info
 
         return get_product_info(topic)
@@ -90,15 +147,94 @@ class LanderAgent(Agent):
 
 
 async def entrypoint(ctx: JobContext) -> None:
+    # Read dashboard config (prompt / knowledge / params) once at call start.
+    # Blocking stdlib HTTP read, so run it off the event loop. Never raises.
+    cfg = await asyncio.to_thread(load_config)
+
+    def p(name: str) -> float:
+        """Effective value: dashboard override if present, else baked-in default."""
+        return cfg.params.get(name, DEFAULTS[name])
+
+    instructions = cfg.prompt or PROMPT_PATH.read_text(encoding="utf-8")
+    voice_settings = elevenlabs.VoiceSettings(
+        stability=p("ELEVENLABS_STABILITY"),
+        similarity_boost=p("ELEVENLABS_SIMILARITY"),
+        style=p("ELEVENLABS_STYLE"),
+        use_speaker_boost=True,
+    )
+
+    print(
+        f"[VOICE] voice_id={ELEVEN_VOICE_ID!r} model={TTS_MODEL!r} api_key_set={bool(ELEVEN_API_KEY)} "
+        f"prompt={'dashboard' if cfg.prompt else 'local'} knowledge={len(cfg.knowledge)}"
+    )
+    # Build the ElevenLabs TTS. `language` is only passed when forced (else auto-detect).
+    tts_kwargs: dict = dict(model=TTS_MODEL, api_key=ELEVEN_API_KEY, voice_settings=voice_settings)
+    if ELEVEN_VOICE_ID:
+        tts_kwargs["voice_id"] = ELEVEN_VOICE_ID
+    if TTS_LANGUAGE:
+        tts_kwargs["language"] = TTS_LANGUAGE
+
     session = AgentSession(
         stt=deepgram.STT(model=STT_MODEL, language="multi"),
         llm=anthropic.LLM(model=LLM_MODEL),
-        tts=cartesia.TTS(voice=CARTESIA_VOICE_ID) if CARTESIA_VOICE_ID else cartesia.TTS(),
+        tts=elevenlabs.TTS(**tts_kwargs),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
+        # Empezar a generar la respuesta en cuanto se detecta fin de turno (probable),
+        # para que Lander conteste antes y suene menos "robótico" por la latencia.
+        turn_handling=TurnHandlingOptions(preemptive_generation=True),
+        # --- Anti-corte (barge-in) sobre línea telefónica con ruido -----------
+        # Exigir voz real (duración + palabras) antes de dar por interrumpido a
+        # Lander, y retomar la frase si la interrupción fue en falso.
+        min_interruption_duration=p("MIN_INTERRUPTION_DURATION"),
+        min_interruption_words=int(p("MIN_INTERRUPTION_WORDS")),
+        resume_false_interruption=True,
+        false_interruption_timeout=p("FALSE_INTERRUPTION_TIMEOUT"),
+        # --- Latencia: responder antes tras detectar fin de turno -------------
+        min_endpointing_delay=p("MIN_ENDPOINTING_DELAY"),
     )
 
-    await session.start(agent=LanderAgent(), room=ctx.room)
+    agent = LanderAgent(instructions=instructions, knowledge=cfg.knowledge)
+
+    # --- Call log: capture transcript + write one row on shutdown -------------
+    transcript: list[dict] = []
+
+    @session.on("conversation_item_added")
+    def _on_item(ev) -> None:  # noqa: ANN001 (livekit event payload)
+        try:
+            item = ev.item
+            text = getattr(item, "text_content", None) or ""
+            role = getattr(item, "role", "") or ""
+            if text:
+                transcript.append({"role": str(role), "text": str(text)})
+        except Exception:  # noqa: BLE001 — never let logging break the call
+            pass
+
+    started_mono = time.monotonic()
+    started_at = datetime.now(timezone.utc).isoformat()
+    # SIP caller number lands in the room name (e.g. "call_+34...") for inbound calls.
+    caller = None
+    room_name = getattr(ctx.room, "name", None)
+    if room_name and "_" in room_name:
+        caller = room_name.rsplit("_", 1)[-1] or None
+
+    async def _write_call_log() -> None:
+        await asyncio.to_thread(
+            save_call_log,
+            room=room_name,
+            caller=caller,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc).isoformat(),
+            duration_seconds=int(time.monotonic() - started_mono),
+            turns=len(transcript),
+            branch=agent.branch,
+            voice_id=ELEVEN_VOICE_ID,
+            transcript=transcript,
+        )
+
+    ctx.add_shutdown_callback(_write_call_log)
+
+    await session.start(agent=agent, room=ctx.room)
 
     # Mandatory opening turn: greet + AI disclosure + offer to help.
     await session.generate_reply(
