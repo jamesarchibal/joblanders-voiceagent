@@ -27,6 +27,10 @@ class RemoteConfig:
     knowledge: list[dict] = field(default_factory=list)  # [{id, topic, answer}, ...]
     params: dict[str, float] = field(default_factory=dict)  # {PARAM_ID: value}
     transfer_script: str | None = None  # guion del agente-susurro (traspaso a humano)
+    # Fake "client CRM": inbound caller-ID -> known client (existing vs new).
+    clients: list[dict] = field(default_factory=list)  # [{phone,name,company,plan,status,notes}]
+    # Directorio de transferencia: departamentos + personas + palabras clave del motivo.
+    directory: list[dict] = field(default_factory=list)  # [{department,person,role,keywords,phone}]
 
 
 def _fetch_rows() -> list[dict]:
@@ -78,9 +82,18 @@ def load_config() -> RemoteConfig:
     if isinstance(ts.get("text"), str) and ts["text"].strip():
         cfg.transfer_script = ts["text"]
 
+    cl = by_key.get("clients") or {}
+    if isinstance(cl.get("list"), list):
+        cfg.clients = [c for c in cl["list"] if isinstance(c, dict)]
+
+    dr = by_key.get("directory") or {}
+    if isinstance(dr.get("people"), list):
+        cfg.directory = [d for d in dr["people"] if isinstance(d, dict)]
+
     print(
         f"[CONFIG] loaded from Supabase: prompt={'yes' if cfg.prompt else 'no'} "
         f"knowledge={len(cfg.knowledge)} params={len(cfg.params)} "
-        f"transfer_script={'yes' if cfg.transfer_script else 'no'}"
+        f"transfer_script={'yes' if cfg.transfer_script else 'no'} "
+        f"clients={len(cfg.clients)} directory={len(cfg.directory)}"
     )
     return cfg

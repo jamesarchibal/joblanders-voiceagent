@@ -93,10 +93,83 @@ def _format_history_es(chat_ctx) -> str:
     return "\n".join(lines)
 
 
+def _last9(phone: str) -> str:
+    """Last 9 digits of a phone (ignores +/00/country prefix + separators)."""
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    return digits[-9:] if len(digits) >= 9 else digits
+
+
+def _match_client(caller: str | None, clients: list[dict]) -> dict | None:
+    """Match the inbound caller-ID against the fake client CRM (existing vs new)."""
+    if not caller or not clients:
+        return None
+    key = _last9(caller)
+    for c in clients:
+        if _last9(str(c.get("phone", ""))) == key and key:
+            return c
+    return None
+
+
+def _caller_context(client: dict | None) -> str:
+    """One paragraph appended to the prompt telling Lander who is calling."""
+    if client:
+        bits = [
+            f"nombre {client['name']}" if client.get("name") else "",
+            f"empresa {client['company']}" if client.get("company") else "",
+            f"plan {client['plan']}" if client.get("plan") else "",
+            f"estado {client['status']}" if client.get("status") else "",
+        ]
+        detail = ", ".join(b for b in bits if b) or "sin más datos"
+        notes = client.get("notes")
+        note_line = f" Notas internas (NO las leas en voz alta): {notes}." if notes else ""
+        return (
+            "LLAMANTE: CLIENTE EXISTENTE reconocido por su número — "
+            f"{detail}.{note_line} No vendas: ya es cliente. Entiende POR QUÉ llama y "
+            "pásale con la persona adecuada del directorio."
+        )
+    return (
+        "LLAMANTE: DESCONOCIDO (no está en la base de clientes). Trátalo como posible "
+        "cliente NUEVO: descubre necesidad y vende. Si resulta que ya es cliente (te da su "
+        "empresa/cuenta), cambia a modo cliente existente."
+    )
+
+
+def _directory_block(directory: list[dict]) -> str:
+    """Format the transfer directory (departments + people + reason keywords)."""
+    if not directory:
+        return ""
+    lines = ["DIRECTORIO DE TRANSFERENCIA (elige department + person según el motivo de la llamada):"]
+    for d in directory:
+        kws = d.get("keywords") or []
+        kw = ", ".join(str(k) for k in kws) if isinstance(kws, list) else str(kws)
+        lines.append(
+            f"- department «{d.get('department', '')}» / person «{d.get('person', '')}» "
+            f"({d.get('role', '')}) — motivos: {kw}"
+        )
+    return "\n".join(lines)
+
+
+def _resolve_dest(person: str | None, directory: list[dict]) -> str:
+    """Phone to dial for the chosen person (from the directory); fallback = TRANSFER_NUMBER.
+
+    Numbers are normalised to netelip's "00" prefix (it rejects the "+" with a 404).
+    Today every directory row points at the same number, so all transfers still ring
+    James — but this real-life-tests that Lander picks the right person/department.
+    """
+    for d in directory:
+        if str(d.get("person", "")).strip().lower() == (person or "").strip().lower():
+            ph = str(d.get("phone") or "").strip()
+            if ph:
+                return "00" + ph[1:] if ph.startswith("+") else ph
+            break
+    return TRANSFER_NUMBER
+
+
 # Guion del agente-susurro (lo que Lander le dice al HUMANO antes de unir las llamadas).
 # Editable desde el dashboard (LanderOS → Traspaso, key `transfer_script` en Supabase);
 # si no hay nada guardado se usa este texto. Tokens que se sustituyen en tiempo real:
-#   {{department}} → "ventas" | "soporte"
+#   {{department}} → "Soporte" | "Comercial"
+#   {{person}}     → persona destinataria del directorio (p.ej. "Ana")
 #   {{summary}}    → resumen en una frase del caso
 #   {{history}}    → conversación previa con el llamante (o aviso de que no la hubo)
 DEFAULT_TRANSFER_SCRIPT = (
@@ -104,12 +177,13 @@ DEFAULT_TRANSFER_SCRIPT = (
     "la persona ha pedido hablar con un humano. AHORA hablas por teléfono con esa "
     "persona del equipo (el humano), NO con el llamante: el llamante NO te oye. "
     "Frases cortas, tono natural, como una persona al teléfono.\n\n"
-    "Departamento: {{department}}.\n"
+    "Departamento: {{department}} — persona destinataria: {{person}}.\n"
     "Resumen en una frase: {{summary}}.\n\n"
     "Conversación previa con el llamante:\n"
     "{{history}}\n\n"
     "Actúa en este orden:\n"
-    "1. Salúdale y dile en una frase que tienes una llamada para pasarle.\n"
+    "1. Salúdale y dile en una frase que tienes una llamada para pasar a {{person}} "
+    "(del equipo de {{department}}).\n"
     "2. Resúmele de qué ha hablado el llamante. Si no ha habido conversación real "
     "(solo quiere hablar con una persona), dilo claramente: no me ha contado nada, "
     "solo quiere hablar con alguien.\n"
@@ -156,31 +230,41 @@ class LanderAgent(Agent):
         instructions: str,
         knowledge: list[dict] | None = None,
         transfer_script: str | None = None,
+        directory: list[dict] | None = None,
     ) -> None:
         super().__init__(instructions=instructions)
         # Optional per-call knowledge from the dashboard; falls back to knowledge.py.
         self._knowledge = knowledge or []
         # Guion del traspaso editable desde el dashboard; si no, el default de arriba.
         self._transfer_script = transfer_script or DEFAULT_TRANSFER_SCRIPT
+        # Directorio de transferencia (departamentos/personas/teléfonos) para enrutar.
+        self._directory = directory or []
         # Detected branch for the call log; set when a transfer happens.
         self.branch: str | None = None
 
     # --- Escape hatch: warm transfer to a human -----------------------------
     @function_tool
-    async def transfer_to_human(self, context: RunContext, department: str, summary: str) -> str:
-        """Transfer the caller to a human agent.
+    async def transfer_to_human(
+        self, context: RunContext, department: str, person: str, summary: str
+    ) -> str:
+        """Transfer the caller to the right human, chosen from the directory.
 
         Call this when the caller asks for a person, refuses to talk to an AI,
-        is frustrated, or the case is beyond what you can resolve.
+        is frustrated, or the case is beyond what you can resolve — and, for an
+        existing client, once you understand why they are calling. Pick the
+        department + person from the DIRECTORIO block whose reason keywords best
+        match the caller's need.
 
         Args:
-            department: "ventas" (sales) or "soporte" (support).
+            department: The department from the directory, e.g. "Soporte" or "Comercial".
+            person: The person from the directory to route to, e.g. "Ana".
             summary: One-sentence summary of the caller's need, in Spanish, so the
                 human doesn't have to ask them to repeat. E.g. "Empresa interesada
                 en el plan para 15 vacantes, urgencia alta."
         """
-        self.branch = "humano" if department not in ("ventas", "soporte") else department
-        print(f"[TRANSFER] -> {department} | summary: {summary}")
+        self.branch = department or "humano"
+        dest = _resolve_dest(person, self._directory)
+        print(f"[TRANSFER] -> {department}/{person} | dial {dest} | summary: {summary}")
 
         # Conversación previa con el llamante, para que el humano tenga contexto real.
         history = _format_history_es(self.chat_ctx)
@@ -195,6 +279,7 @@ class LanderAgent(Agent):
         whisper_instructions = (
             self._transfer_script
             .replace("{{department}}", department)
+            .replace("{{person}}", person or "el equipo")
             .replace("{{summary}}", summary)
             .replace("{{history}}", history_block)
         )
@@ -204,7 +289,7 @@ class LanderAgent(Agent):
         # Awaiting the task returns on success or RAISES on no-answer/voicemail/decline.
         try:
             await _LanderWarmTransfer(
-                sip_call_to=TRANSFER_NUMBER,
+                sip_call_to=dest,
                 sip_trunk_id=OUTBOUND_TRUNK,
                 ringing_timeout=30,
                 chat_ctx=self.chat_ctx,
@@ -323,7 +408,22 @@ async def entrypoint(ctx: JobContext) -> None:
         """Effective value: dashboard override if present, else baked-in default."""
         return cfg.params.get(name, DEFAULTS[name])
 
+    # SIP caller number lands in the room name (e.g. "call_+34...") for inbound calls.
+    caller = None
+    call_room_name = getattr(ctx.room, "name", None)
+    if call_room_name and "_" in call_room_name:
+        caller = call_room_name.rsplit("_", 1)[-1] or None
+
+    # New vs existing: match the caller-ID against the fake client CRM, then tell Lander
+    # who is calling and give it the transfer directory so it can route to the right person.
+    client = _match_client(caller, cfg.clients)
+    print(f"[CLIENT] caller={caller!r} -> {'EXISTING ' + str(client.get('company')) if client else 'NEW/unknown'}")
+
     instructions = cfg.prompt or PROMPT_PATH.read_text(encoding="utf-8")
+    instructions = instructions + "\n\n" + _caller_context(client)
+    directory_block = _directory_block(cfg.directory)
+    if directory_block:
+        instructions = instructions + "\n\n" + directory_block
     voice_settings = elevenlabs.VoiceSettings(
         stability=p("ELEVENLABS_STABILITY"),
         similarity_boost=p("ELEVENLABS_SIMILARITY"),
@@ -365,6 +465,7 @@ async def entrypoint(ctx: JobContext) -> None:
         instructions=instructions,
         knowledge=cfg.knowledge,
         transfer_script=cfg.transfer_script,
+        directory=cfg.directory,
     )
 
     # --- Multilingüe: cambia a la voz clonada del idioma del llamante ----------
@@ -402,16 +503,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     started_mono = time.monotonic()
     started_at = datetime.now(timezone.utc).isoformat()
-    # SIP caller number lands in the room name (e.g. "call_+34...") for inbound calls.
-    caller = None
-    room_name = getattr(ctx.room, "name", None)
-    if room_name and "_" in room_name:
-        caller = room_name.rsplit("_", 1)[-1] or None
 
     async def _write_call_log() -> None:
         await asyncio.to_thread(
             save_call_log,
-            room=room_name,
+            room=call_room_name,
             caller=caller,
             started_at=started_at,
             ended_at=datetime.now(timezone.utc).isoformat(),
