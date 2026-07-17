@@ -34,11 +34,11 @@ JAMES = "+34623004169"
 CLIENTS = [
     {
         "phone": JAMES,
-        "name": "James",
-        "company": "Marlex",
+        "name": "James (test)",
+        "company": "Cliente Demo",
         "plan": "Pro",
         "status": "activo",
-        "notes": "Cuenta piloto, 8 vacantes activas. Suele llamar por temas de soporte.",
+        "notes": "Fila de PRUEBA (el número de James) para testear el flujo de cliente existente.",
     },
     {
         "phone": "+34600111222",
