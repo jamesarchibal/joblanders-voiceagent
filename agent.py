@@ -110,8 +110,45 @@ def _match_client(caller: str | None, clients: list[dict]) -> dict | None:
     return None
 
 
-def _caller_context(client: dict | None) -> str:
+def _match_knowledge(topic: str, knowledge: list[dict], category: str) -> dict | None:
+    """Match a caller topic against the editable KB facts of ONE category.
+
+    The dashboard splits knowledge into "sales" (quoted to new clients) and
+    "support" (quoted to existing clients). A fact with no category is treated as
+    "sales" for backward-compat. Returns the tool-result dict on a hit (found or a
+    not-public sentinel), or None if nothing in this category matched (caller then
+    falls back to the baked-in knowledge module).
+    """
+    topic_l = (topic or "").lower()
+    for fact in knowledge:
+        if (fact.get("category") or "sales") != category:
+            continue
+        hay = f"{fact.get('topic', '')} {fact.get('id', '')}".lower()
+        if any(w and w in hay for w in topic_l.split()):
+            answer = str(fact.get("answer", ""))
+            if "PENDIENTE_DEFINIR" in answer:
+                return {
+                    "found": False,
+                    "reason": "not_public",
+                    "say": answer.split("—", 1)[-1].strip() or answer,
+                }
+            return {"found": True, "topic": fact.get("topic"), "answer": answer}
+    return None
+
+
+def _person_dept(person: str | None, directory: list[dict]) -> str | None:
+    """Department a directory person belongs to (e.g. account manager -> «Cuentas»)."""
+    if not person:
+        return None
+    for d in directory:
+        if str(d.get("person", "")).strip().lower() == person.strip().lower():
+            return str(d.get("department") or "") or None
+    return None
+
+
+def _caller_context(client: dict | None, directory: list[dict] | None = None) -> str:
     """One paragraph appended to the prompt telling Lander who is calling."""
+    directory = directory or []
     if client:
         bits = [
             f"nombre {client['name']}" if client.get("name") else "",
@@ -122,15 +159,32 @@ def _caller_context(client: dict | None) -> str:
         detail = ", ".join(b for b in bits if b) or "sin más datos"
         notes = client.get("notes")
         note_line = f" Notas internas (NO las leas en voz alta): {notes}." if notes else ""
+        # Gestor de cuenta asignado: resuelto al instante del registro del cliente (sin
+        # latencia). Es el destino por defecto del traspaso; si no hay, el dept General.
+        am = str(client.get("account_manager") or "").strip()
+        if am:
+            am_dept = _person_dept(am, directory)
+            dept_txt = f" (departamento {am_dept})" if am_dept else ""
+            am_line = (
+                f" Su gestor de cuenta asignado es {am}{dept_txt}: es a quien debes pasarle "
+                "por defecto, salvo que el motivo sea claramente de otro departamento del directorio."
+            )
+        else:
+            am_line = (
+                " No tiene gestor de cuenta asignado: si hay que pasarle con alguien y el motivo "
+                "no encaja claramente en un departamento, usa el departamento «General» (Recepción)."
+            )
         return (
             "LLAMANTE: CLIENTE EXISTENTE reconocido por su número — "
-            f"{detail}.{note_line} No vendas: ya es cliente. Entiende POR QUÉ llama y "
+            f"{detail}.{note_line}{am_line} No vendas: ya es cliente. Entiende POR QUÉ llama y "
             "pásale con la persona adecuada del directorio."
         )
     return (
-        "LLAMANTE: DESCONOCIDO (no está en la base de clientes). Trátalo como posible "
-        "cliente NUEVO: descubre necesidad y vende. Si resulta que ya es cliente (te da su "
-        "empresa/cuenta), cambia a modo cliente existente."
+        "LLAMANTE: DESCONOCIDO (no está en la base de clientes por su número, o el número "
+        "llegó oculto). Trátalo como posible cliente NUEVO: descubre necesidad y vende. Pero "
+        "si dice que ya trabaja con Joblanders (o el número venía oculto), pídele su email en "
+        "una frase y usa la herramienta identify_by_email para reconocerlo; si lo encuentra, "
+        "pasa a modo cliente existente con los datos que devuelva."
     )
 
 
@@ -168,7 +222,7 @@ def _resolve_dest(person: str | None, directory: list[dict]) -> str:
 # Guion del agente-susurro (lo que Lander le dice al HUMANO antes de unir las llamadas).
 # Editable desde el dashboard (LanderOS → Traspaso, key `transfer_script` en Supabase);
 # si no hay nada guardado se usa este texto. Tokens que se sustituyen en tiempo real:
-#   {{department}} → "Soporte" | "Comercial"
+#   {{department}} → "Comercial" | "Cuentas" | "General"
 #   {{person}}     → persona destinataria del directorio (p.ej. "Ana")
 #   {{summary}}    → resumen en una frase del caso
 #   {{history}}    → conversación previa con el llamante (o aviso de que no la hubo)
@@ -206,6 +260,22 @@ class _LanderWarmTransfer(WarmTransferTask):
     avisamos al llamante.
     """
 
+    async def on_enter(self) -> None:
+        # La tarea de fábrica marca al humano y luego "let the human speak first":
+        # el agente-susurro se queda callado esperando a que el humano hable. Pero el
+        # humano acaba de descolgar una llamada que LE hemos hecho nosotros, así que
+        # espera que le saludemos primero — ambos se quedan en silencio y el humano
+        # cuelga a los ~20s (CLIENT_INITIATED -> ROOM_DELETED). Arreglo: en cuanto el
+        # humano contesta (super().on_enter() vuelve con wait_until_answered=True),
+        # hacemos que el susurro hable primero con su guion (saludo + resumen + permiso).
+        await super().on_enter()
+        if self._human_agent_sess is not None:
+            # Margen breve para que el track de audio del humano quede suscrito antes
+            # de hablar (si no, se pierde el arranque de la frase).
+            await asyncio.sleep(0.6)
+            with contextlib.suppress(Exception):
+                self._human_agent_sess.generate_reply()
+
     async def _merge_calls(self) -> None:
         # Paramos la música de espera y reactivamos el audio del llamante para que
         # nos oiga (el merge posterior y _set_result vuelven a hacerlo, es idempotente).
@@ -231,6 +301,7 @@ class LanderAgent(Agent):
         knowledge: list[dict] | None = None,
         transfer_script: str | None = None,
         directory: list[dict] | None = None,
+        clients: list[dict] | None = None,
     ) -> None:
         super().__init__(instructions=instructions)
         # Optional per-call knowledge from the dashboard; falls back to knowledge.py.
@@ -239,8 +310,43 @@ class LanderAgent(Agent):
         self._transfer_script = transfer_script or DEFAULT_TRANSFER_SCRIPT
         # Directorio de transferencia (departamentos/personas/teléfonos) para enrutar.
         self._directory = directory or []
+        # Lista de clientes (CRM del dashboard) para el fallback de identificación por
+        # email cuando el número no coincide o llega oculto.
+        self._clients = clients or []
         # Detected branch for the call log; set when a transfer happens.
         self.branch: str | None = None
+
+    # --- Fallback: identificar a un cliente por email -----------------------
+    @function_tool
+    async def identify_by_email(self, context: RunContext, email: str) -> dict:
+        """Identify an existing client by email when their phone number wasn't
+        recognised or came in withheld/hidden.
+
+        Use this ONLY when the LLAMANTE block says the caller is unknown BUT the
+        person indicates they are already a client (or the number came hidden).
+        Ask them for their email in one short sentence, then call this. If it
+        returns found=true, switch to existing-client mode using the returned
+        context (don't sell; route them to their account manager). If found=false,
+        read the `say` intent and treat them as a new client or offer a human.
+
+        Args:
+            email: The email address the caller gives, e.g. "laura@empresa.com".
+        """
+        key = (email or "").strip().lower()
+        if not key:
+            return {"found": False, "say": "No he entendido el email; pídeselo de nuevo."}
+        for c in self._clients:
+            if str(c.get("email", "")).strip().lower() == key and key:
+                print(f"[CLIENT] identified by email={key!r} -> {c.get('company')}")
+                return {"found": True, "context": _caller_context(c, self._directory)}
+        print(f"[CLIENT] email={key!r} not found in CRM")
+        return {
+            "found": False,
+            "say": (
+                "No encuentro ese email en el sistema. Trátalo como cliente nuevo; si "
+                "insiste en que ya es cliente, ofrécele pasar con una persona."
+            ),
+        }
 
     # --- Escape hatch: warm transfer to a human -----------------------------
     @function_tool
@@ -349,24 +455,37 @@ class LanderAgent(Agent):
                 "cómo funciona el matching".
         """
         # Prefer dashboard-managed knowledge (LanderOS → Knowledge tab): match the
-        # topic against the editable facts. Never quote a price sentinel.
-        topic_l = (topic or "").lower()
-        for fact in self._knowledge:
-            hay = f"{fact.get('topic', '')} {fact.get('id', '')}".lower()
-            if any(w and w in hay for w in topic_l.split()):
-                answer = str(fact.get("answer", ""))
-                if "PENDIENTE_DEFINIR" in answer:
-                    return {
-                        "found": False,
-                        "reason": "not_public",
-                        "say": answer.split("—", 1)[-1].strip() or answer,
-                    }
-                return {"found": True, "topic": fact.get("topic"), "answer": answer}
+        # topic against the editable SALES facts only. Never quote a price sentinel.
+        hit = _match_knowledge(topic, self._knowledge, "sales")
+        if hit is not None:
+            return hit
 
         # Fallback to the baked-in knowledge module.
         from knowledge import get_product_info
 
         return get_product_info(topic)
+
+    # --- Support: knowledge for existing clients ----------------------------
+    @function_tool
+    async def get_support_info(self, context: RunContext, topic: str) -> dict:
+        """Get factual support info you are allowed to quote to an EXISTING client
+        who is fine talking to you (how the product works, common issues, policies).
+
+        Use this instead of improvising. If it returns found=false, offer to pass
+        them with their account person — never invent an answer or a policy.
+
+        Args:
+            topic: What the caller asked about, e.g. "no puedo entrar",
+                "cómo recibo a los candidatos", "cambiar mi plan".
+        """
+        hit = _match_knowledge(topic, self._knowledge, "support")
+        if hit is not None:
+            return hit
+
+        # Fallback to the baked-in knowledge module.
+        from knowledge import get_support_info
+
+        return get_support_info(topic)
 
     # --- Support: application/account lookup --------------------------------
     @function_tool
@@ -408,19 +527,30 @@ async def entrypoint(ctx: JobContext) -> None:
         """Effective value: dashboard override if present, else baked-in default."""
         return cfg.params.get(name, DEFAULTS[name])
 
-    # SIP caller number lands in the room name (e.g. "call_+34...") for inbound calls.
+    # SIP caller number lands in the room name for inbound calls. LiveKit names the
+    # room "call_<phone>_<random>" (e.g. "call_+34623004169_H9CcJpBaDFF5"), so we must
+    # take the part BETWEEN "call_" and the trailing random id — NOT rsplit's last
+    # chunk (that grabbed the random id and made every caller look unknown).
     caller = None
     call_room_name = getattr(ctx.room, "name", None)
-    if call_room_name and "_" in call_room_name:
+    if call_room_name and call_room_name.startswith("call_"):
+        caller = call_room_name[len("call_"):].rsplit("_", 1)[0] or None
+    elif call_room_name and "_" in call_room_name:
         caller = call_room_name.rsplit("_", 1)[-1] or None
 
     # New vs existing: match the caller-ID against the fake client CRM, then tell Lander
     # who is calling and give it the transfer directory so it can route to the right person.
     client = _match_client(caller, cfg.clients)
-    print(f"[CLIENT] caller={caller!r} -> {'EXISTING ' + str(client.get('company')) if client else 'NEW/unknown'}")
+    if client:
+        print(
+            f"[CLIENT] caller={caller!r} -> EXISTING {client.get('company')} "
+            f"| gestor={client.get('account_manager') or '—'}"
+        )
+    else:
+        print(f"[CLIENT] caller={caller!r} -> NEW/unknown")
 
     instructions = cfg.prompt or PROMPT_PATH.read_text(encoding="utf-8")
-    instructions = instructions + "\n\n" + _caller_context(client)
+    instructions = instructions + "\n\n" + _caller_context(client, cfg.directory)
     directory_block = _directory_block(cfg.directory)
     if directory_block:
         instructions = instructions + "\n\n" + directory_block
@@ -466,6 +596,7 @@ async def entrypoint(ctx: JobContext) -> None:
         knowledge=cfg.knowledge,
         transfer_script=cfg.transfer_script,
         directory=cfg.directory,
+        clients=cfg.clients,
     )
 
     # --- Multilingüe: cambia a la voz clonada del idioma del llamante ----------
@@ -505,6 +636,23 @@ async def entrypoint(ctx: JobContext) -> None:
     started_at = datetime.now(timezone.utc).isoformat()
 
     async def _write_call_log() -> None:
+        # Real per-provider usage (not a transcript-length estimate) — see
+        # AgentSession.usage in livekit-agents' metrics/usage.py.
+        tts_characters = tts_audio_seconds = stt_audio_seconds = 0
+        llm_input_tokens = llm_output_tokens = 0
+        try:
+            for u in session.usage.model_usage:
+                if u.type == "tts_usage":
+                    tts_characters += u.characters_count
+                    tts_audio_seconds += u.audio_duration
+                elif u.type == "stt_usage":
+                    stt_audio_seconds += u.audio_duration
+                elif u.type == "llm_usage":
+                    llm_input_tokens += u.input_tokens
+                    llm_output_tokens += u.output_tokens
+        except Exception:  # noqa: BLE001 — usage is a nice-to-have, never break shutdown
+            pass
+
         await asyncio.to_thread(
             save_call_log,
             room=call_room_name,
@@ -516,6 +664,11 @@ async def entrypoint(ctx: JobContext) -> None:
             branch=agent.branch,
             voice_id=ELEVEN_VOICE_ID,
             transcript=transcript,
+            tts_characters=tts_characters,
+            tts_audio_seconds=tts_audio_seconds,
+            stt_audio_seconds=stt_audio_seconds,
+            llm_input_tokens=llm_input_tokens,
+            llm_output_tokens=llm_output_tokens,
         )
 
     ctx.add_shutdown_callback(_write_call_log)

@@ -59,6 +59,23 @@ def get_product_info(topic: str) -> dict:
     }
 
 
+def get_support_info(topic: str) -> dict:
+    """Return factual SUPPORT info the agent may quote to an existing client.
+
+    Fallback only: the live support facts are managed in the dashboard (LanderOS →
+    Knowledge, "Soporte"). Until those are filled there's nothing baked in here, so
+    this defers to a human rather than invent a how-to or a policy.
+    """
+    return {
+        "found": False,
+        "reason": "not_in_kb",
+        "say": (
+            "Eso lo confirmo con una persona del equipo para no darte un dato "
+            "equivocado; te paso con quien lleva tu cuenta."
+        ),
+    }
+
+
 def lookup_application_status(reference: str) -> dict:
     """Look up a candidate application / account by reference.
 
