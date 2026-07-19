@@ -2,7 +2,7 @@
 
 Writes two rows into `landeros_config` (same table the agent already reads at call
 start via config.py):
-  - key "clients"   -> {"list":[ {phone,name,company,plan,status,notes}, ... ]}
+  - key "clients"   -> {"list":[ {phone,name,company,plan,status,account_manager,notes}, ... ]}
   - key "directory" -> {"people":[ {department,person,role,keywords,phone}, ... ]}
 
 This is fake test data so we can real-life-test "new vs existing client" routing.
@@ -31,6 +31,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY
 # recognised during testing. Also the single real transfer destination for now.
 JAMES = "+34623004169"
 
+# `account_manager` = persona del DIRECTORY que gestiona a ese cliente. Para un
+# cliente EXISTENTE, Lander tiende a pasarle con su gestor (salvo que el motivo sea
+# claramente de otro departamento). Si un cliente no tiene gestor -> departamento General.
 CLIENTS = [
     {
         "phone": JAMES,
@@ -38,6 +41,7 @@ CLIENTS = [
         "company": "Cliente Demo",
         "plan": "Pro",
         "status": "activo",
+        "account_manager": "Luis",
         "notes": "Fila de PRUEBA (el número de James) para testear el flujo de cliente existente.",
     },
     {
@@ -46,13 +50,14 @@ CLIENTS = [
         "company": "Randstad",
         "plan": "Enterprise",
         "status": "activo",
+        "account_manager": "Jordi",
         "notes": "Renovación en septiembre; interesada en ampliar volumen de vacantes.",
     },
 ]
 
 DIRECTORY = [
     {
-        "department": "Soporte",
+        "department": "Cuentas",
         "person": "Ana",
         "role": "incidencias técnicas y acceso",
         "keywords": ["no puedo entrar", "error", "bug", "acceso", "la app no va",
@@ -60,7 +65,7 @@ DIRECTORY = [
         "phone": JAMES,
     },
     {
-        "department": "Soporte",
+        "department": "Cuentas",
         "person": "Luis",
         "role": "cuenta y facturación",
         "keywords": ["factura", "pago", "cobro", "cuenta", "suscripción", "baja",
@@ -81,6 +86,13 @@ DIRECTORY = [
         "role": "ampliaciones y renovaciones",
         "keywords": ["ampliar", "más vacantes", "añadir", "upgrade", "renovar",
                      "subir plan", "upsell", "más volumen"],
+        "phone": JAMES,
+    },
+    {
+        "department": "General",
+        "person": "Recepción",
+        "role": "recepción general (fallback cuando no hay gestor ni departamento claro)",
+        "keywords": ["hablar con alguien", "recepción", "general", "no sé", "cualquiera"],
         "phone": JAMES,
     },
 ]
