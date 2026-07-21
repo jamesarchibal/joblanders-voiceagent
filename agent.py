@@ -35,7 +35,7 @@ from livekit.agents.beta.workflows import WarmTransferTask
 from livekit.plugins import anthropic, deepgram, elevenlabs, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-from calllog import save_call_log
+from calllog import fetch_prior_calls, save_call_log
 from config import load_config
 
 load_dotenv(override=True)
@@ -108,6 +108,31 @@ def _match_client(caller: str | None, clients: list[dict]) -> dict | None:
         if _last9(str(c.get("phone", ""))) == key and key:
             return c
     return None
+
+
+def _recall_block(prior: list[dict]) -> str:
+    """Compact 'previous interactions' block from this caller's past call rows, so
+    Lander can give continuity to a returning caller. Kept short to protect the
+    context budget: date + detected branch + a trimmed gist of what the caller said.
+    """
+    if not prior:
+        return ""
+    lines = [
+        "INTERACCIONES PREVIAS CON ESTE LLAMANTE (contexto para dar continuidad; "
+        "NO lo leas en voz alta literalmente, úsalo solo si es relevante):"
+    ]
+    for row in prior:
+        when = str(row.get("started_at") or "")[:10]
+        branch = row.get("branch") or "—"
+        turns = row.get("transcript") or []
+        user_bits = [
+            str(t.get("text", "")).strip()
+            for t in turns
+            if str(t.get("role", "")).startswith("user") and str(t.get("text", "")).strip()
+        ]
+        gist = " · ".join(user_bits)[:220]
+        lines.append(f"- {when} (motivo: {branch}): {gist or 'sin transcripción'}")
+    return "\n".join(lines)
 
 
 def _match_knowledge(topic: str, knowledge: list[dict], category: str) -> dict | None:
@@ -549,8 +574,16 @@ async def entrypoint(ctx: JobContext) -> None:
     else:
         print(f"[CLIENT] caller={caller!r} -> NEW/unknown")
 
+    # Recall: past calls from this same caller become context for continuity.
+    # Best-effort read (never raises); matched by last-9-digits like the CRM.
+    prior_calls = await asyncio.to_thread(fetch_prior_calls, caller)
+    print(f"[RECALL] caller={caller!r} -> {len(prior_calls)} prior call(s)")
+
     instructions = cfg.prompt or PROMPT_PATH.read_text(encoding="utf-8")
     instructions = instructions + "\n\n" + _caller_context(client, cfg.directory)
+    recall_block = _recall_block(prior_calls)
+    if recall_block:
+        instructions = instructions + "\n\n" + recall_block
     directory_block = _directory_block(cfg.directory)
     if directory_block:
         instructions = instructions + "\n\n" + directory_block

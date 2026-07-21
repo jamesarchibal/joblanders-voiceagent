@@ -56,6 +56,48 @@ def _post(payload: dict) -> tuple[int, str]:
         return resp.status, ""
 
 
+def _last9(phone: str | None) -> str:
+    """Last 9 digits of a phone (ignores +/00/country prefix + separators)."""
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    return digits[-9:] if len(digits) >= 9 else digits
+
+
+def fetch_prior_calls(caller: str | None, *, limit: int = 3) -> list[dict]:
+    """Best-effort read of this caller's most recent past calls. Never raises.
+
+    Matches by the last 9 digits of the phone (same rule as client matching in
+    agent.py), so formatting differences (+34 / 0034 / spaces) still line up.
+    Returns the newest `limit` rows (started_at/branch/duration_seconds/transcript)
+    so the agent can greet a returning caller with continuity.
+    """
+    key = _last9(caller)
+    if not (SUPABASE_URL and SUPABASE_KEY and key):
+        return []
+    query = (
+        f"{SUPABASE_URL}/rest/v1/landeros_calls"
+        f"?select=started_at,branch,duration_seconds,transcript"
+        f"&caller=like.*{key}"
+        f"&order=started_at.desc"
+        f"&limit={int(limit)}"
+    )
+    req = urllib.request.Request(
+        query,
+        method="GET",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 (trusted URL)
+            rows = json.loads(resp.read().decode("utf-8"))
+        return rows if isinstance(rows, list) else []
+    except Exception as exc:  # noqa: BLE001 — recall is a nice-to-have, never break a call
+        print(f"[CALLLOG] fetch_prior_calls failed ({exc!r})")
+        return []
+
+
 def save_call_log(
     *,
     room: str | None,
