@@ -708,14 +708,25 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await session.start(agent=agent, room=ctx.room)
 
-    # Mandatory opening turn: greet + AI disclosure + offer to help.
-    await session.generate_reply(
-        instructions=(
-            "Da tu primer turno: saluda, di tu nombre, revela claramente que eres "
-            "una inteligencia artificial, y pregunta en qué puedes ayudar. Una sola "
-            "frase natural, cálida y breve."
+    # Mandatory opening turn: STATIC greeting via TTS (no LLM) so the caller ALWAYS
+    # hears Lander instantly, even if the first Anthropic completion is slow or times
+    # out on a cold start. Covers name + AI disclosure + offer to help. The LLM only
+    # kicks in from the caller's first reply onward (with client/recall context).
+    try:
+        await session.say(
+            "Hola, soy Lander, el asistente virtual con inteligencia artificial de "
+            "Joblanders. ¿En qué puedo ayudarte?",
+            allow_interruptions=True,
         )
-    )
+    except Exception as exc:  # noqa: BLE001 — never let the greeting break the call
+        print(f"[GREETING] static say failed ({exc!r}); falling back to LLM reply")
+        await session.generate_reply(
+            instructions=(
+                "Da tu primer turno: saluda, di tu nombre, revela claramente que eres "
+                "una inteligencia artificial, y pregunta en qué puedes ayudar. Una sola "
+                "frase natural, cálida y breve."
+            )
+        )
 
 
 if __name__ == "__main__":
