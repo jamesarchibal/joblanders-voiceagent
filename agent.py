@@ -547,6 +547,15 @@ async def entrypoint(ctx: JobContext) -> None:
         print(f"[TRANSFER] skip auto-dispatch to warm-transfer sub-room {room_name!r}")
         return
 
+    # Pre-warm rooms: the web "call" button creates a "warmup-*" room a few seconds before
+    # the real PSTN call connects, which auto-dispatches THIS entrypoint and thus cold-starts
+    # the worker ahead of time. We only need the process awake — do NO work (no config read,
+    # no session, no TTS/LLM), so the warm-up costs ~nothing. By the time the caller dials,
+    # the worker is already hot and answers instantly.
+    if room_name.startswith("warmup-"):
+        print(f"[PREWARM] worker warmed via {room_name!r}; returning without a session")
+        return
+
     # Read dashboard config (prompt / knowledge / params) once at call start.
     # Blocking stdlib HTTP read, so run it off the event loop. Never raises.
     cfg = await asyncio.to_thread(load_config)
@@ -610,7 +619,7 @@ async def entrypoint(ctx: JobContext) -> None:
     tts = elevenlabs.TTS(**tts_kwargs)
 
     session = AgentSession(
-        stt=deepgram.STT(model=STT_MODEL, language="multi"),
+        stt=deepgram.STT(model=STT_MODEL, language="es"),
         llm=anthropic.LLM(model=LLM_MODEL),
         tts=tts,
         vad=silero.VAD.load(),
@@ -635,24 +644,9 @@ async def entrypoint(ctx: JobContext) -> None:
         clients=cfg.clients,
     )
 
-    # --- Multilingüe: cambia a la voz clonada del idioma del llamante ----------
-    # Deepgram (multi) detecta el idioma de cada turno; si es catalán o inglés,
-    # usamos la voz clonada correspondiente; cualquier otro idioma usa la voz ES.
-    current_voice = {"id": ELEVEN_VOICE_ID}
-
-    @session.on("user_input_transcribed")
-    def _on_lang(ev) -> None:  # noqa: ANN001 (livekit event payload)
-        try:
-            if not getattr(ev, "is_final", False) or not getattr(ev, "language", None):
-                return
-            lang = str(ev.language).split("-")[0].lower()
-            vid = VOICE_BY_LANG.get(lang, ELEVEN_VOICE_ID)
-            if vid and vid != current_voice["id"]:
-                current_voice["id"] = vid
-                tts.update_options(voice_id=vid)
-                print(f"[VOICE] lang={lang} -> voice={vid}")
-        except Exception:  # noqa: BLE001 — nunca romper la llamada por esto
-            pass
+    # Idioma bloqueado a español: Deepgram STT en language="es" y voz ES fija.
+    # (Se retiró el auto-cambio de voz por idioma: en línea telefónica con ruido
+    # detectaba mal el español y saltaba a otro idioma/voz a mitad de llamada.)
 
     # --- Call log: capture transcript + write one row on shutdown -------------
     transcript: list[dict] = []
@@ -672,6 +666,12 @@ async def entrypoint(ctx: JobContext) -> None:
     started_at = datetime.now(timezone.utc).isoformat()
 
     async def _write_call_log() -> None:
+        # Browser test sessions (Probar Lander) run the full agent but must NOT pollute
+        # the real-call metrics in the Estado tab — skip persisting them.
+        if (call_room_name or "").startswith("webtest-"):
+            print(f"[CALLLOG] skip webtest room {call_room_name!r}")
+            return
+
         # Real per-provider usage (not a transcript-length estimate) — see
         # AgentSession.usage in livekit-agents' metrics/usage.py.
         tts_characters = tts_audio_seconds = stt_audio_seconds = 0
@@ -711,20 +711,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await session.start(agent=agent, room=ctx.room)
 
-    # Ambient background audio: a subtle office hum for a human call-centre feel,
-    # plus soft "thinking" keystrokes that play while the LLM generates — which also
-    # masks brief Anthropic latency so the line never sounds dead. Tune volumes /
-    # swap the ambience clip (CITY/FOREST/CROWDED_ROOM/HOLD_MUSIC) here. Best-effort.
-    background_audio = BackgroundAudioPlayer(
-        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.3),
-        thinking_sound=[
-            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=0.5),
-            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.4),
-        ],
-    )
-    with contextlib.suppress(Exception):
-        await background_audio.start(room=ctx.room, agent_session=session)
-
     # Mandatory opening turn: STATIC greeting via TTS (no LLM) so the caller ALWAYS
     # hears Lander instantly, even if the first Anthropic completion is slow or times
     # out on a cold start. Covers name + AI disclosure + offer to help. The LLM only
@@ -744,6 +730,17 @@ async def entrypoint(ctx: JobContext) -> None:
                 "frase natural, cálida y breve."
             )
         )
+
+    # Ambient background sound (call-center feel). Started AFTER the greeting so it can
+    # never delay or hijack the mandatory opening turn — that ordering broke calls once.
+    # Fully guarded: if the audio player fails, the conversation continues unaffected.
+    try:
+        background_audio = BackgroundAudioPlayer(
+            ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.15),
+        )
+        await background_audio.start(room=ctx.room, agent_session=session)
+    except Exception as exc:  # noqa: BLE001 — background audio is cosmetic, never fatal
+        print(f"[BGAUDIO] background audio failed to start ({exc!r}); continuing silent")
 
 
 if __name__ == "__main__":
