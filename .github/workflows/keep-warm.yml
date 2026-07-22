@@ -1,0 +1,63 @@
+name: keep-warm
+
+# Free cold-start mitigation. The LiveKit Cloud worker scales to zero when idle, so the
+# first call after a quiet stretch cold-starts (~4-5s) and the phone rings unanswered.
+# This creates a short-lived "warmup-*" room on a schedule; the agent auto-dispatches into
+# it, hits its warmup fast-path (returns immediately, ~zero cost), and by doing so keeps the
+# worker hot. Business-hours weekdays only to stay within the free Actions budget on a
+# private repo (each run bills 1 min). Nights/weekends still cold-start on the first call —
+# for true 24/7 always-warm, upgrade LiveKit to the Ship plan.
+
+on:
+  schedule:
+    # Every 10 min, 06:00–19:59 UTC (≈ 08:00–21:00 Madrid), Mon–Fri.
+    - cron: '*/10 6-19 * * 1-5'
+  workflow_dispatch: {} # allow a manual run to verify
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Wake the LiveKit worker
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, hmac, json, os, time, urllib.request
+
+          key = os.environ["LIVEKIT_API_KEY"]
+          secret = os.environ["LIVEKIT_API_SECRET"].encode()
+          host = os.environ["LIVEKIT_URL"].replace("wss://", "https://").replace("ws://", "http://")
+          room = f"warmup-cron-{int(time.time())}"
+
+          def b64(raw: bytes) -> bytes:
+              return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+          now = int(time.time())
+          header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+          payload = b64(json.dumps({
+              "iss": key, "sub": "keepwarm", "nbf": now, "exp": now + 300,
+              "video": {"roomCreate": True, "room": room},
+          }).encode())
+          sig = b64(hmac.new(secret, header + b"." + payload, hashlib.sha256).digest())
+          token = (header + b"." + payload + b"." + sig).decode()
+
+          # CreateRoom triggers the agent's automatic dispatch -> wakes the worker.
+          # empty_timeout closes the throwaway room a few seconds after the agent leaves.
+          req = urllib.request.Request(
+              host + "/twirp/livekit.RoomService/CreateRoom",
+              data=json.dumps({"name": room, "empty_timeout": 15}).encode(),
+              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=15) as resp:
+              print("HTTP", resp.status, "->", room)
+              print(resp.read().decode()[:300])
+          PY
