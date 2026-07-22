@@ -25,6 +25,9 @@ from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentSession,
+    AudioConfig,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
     JobContext,
     RunContext,
     WorkerOptions,
@@ -707,6 +710,20 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(_write_call_log)
 
     await session.start(agent=agent, room=ctx.room)
+
+    # Ambient background audio: a subtle office hum for a human call-centre feel,
+    # plus soft "thinking" keystrokes that play while the LLM generates — which also
+    # masks brief Anthropic latency so the line never sounds dead. Tune volumes /
+    # swap the ambience clip (CITY/FOREST/CROWDED_ROOM/HOLD_MUSIC) here. Best-effort.
+    background_audio = BackgroundAudioPlayer(
+        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.3),
+        thinking_sound=[
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=0.5),
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.4),
+        ],
+    )
+    with contextlib.suppress(Exception):
+        await background_audio.start(room=ctx.room, agent_session=session)
 
     # Mandatory opening turn: STATIC greeting via TTS (no LLM) so the caller ALWAYS
     # hears Lander instantly, even if the first Anthropic completion is slow or times
