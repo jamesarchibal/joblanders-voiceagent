@@ -41,7 +41,7 @@ CLIENTS = [
         "company": "Cliente Demo",
         "plan": "Pro",
         "status": "activo",
-        "account_manager": "Luis",
+        "account_manager": "James",
         "notes": "Fila de PRUEBA (el número de James) para testear el flujo de cliente existente.",
     },
     {
@@ -50,15 +50,19 @@ CLIENTS = [
         "company": "Randstad",
         "plan": "Enterprise",
         "status": "activo",
-        "account_manager": "Jordi",
+        "account_manager": "James",
         "notes": "Renovación en septiembre; interesada en ampliar volumen de vacantes.",
     },
 ]
 
+# Todas las personas son "James" por ahora: hoy hay UN solo humano real y todas las
+# transferencias marcan su número. Se mantienen los departamentos + keywords para el
+# enrutado; cuando haya equipo real, sustituir cada `person`/`phone` por la persona
+# y número correctos.
 DIRECTORY = [
     {
         "department": "Cuentas",
-        "person": "Ana",
+        "person": "James",
         "role": "incidencias técnicas y acceso",
         "keywords": ["no puedo entrar", "error", "bug", "acceso", "la app no va",
                      "falla", "técnico", "contraseña", "no funciona"],
@@ -66,7 +70,7 @@ DIRECTORY = [
     },
     {
         "department": "Cuentas",
-        "person": "Luis",
+        "person": "James",
         "role": "cuenta y facturación",
         "keywords": ["factura", "pago", "cobro", "cuenta", "suscripción", "baja",
                      "recibo", "plan actual", "precio de mi plan"],
@@ -74,7 +78,7 @@ DIRECTORY = [
     },
     {
         "department": "Comercial",
-        "person": "Marta",
+        "person": "James",
         "role": "nuevas empresas",
         "keywords": ["contratar", "empezar", "nuevo", "precio", "demo", "interesado",
                      "cómo funciona", "alta", "quiero contratar"],
@@ -82,7 +86,7 @@ DIRECTORY = [
     },
     {
         "department": "Comercial",
-        "person": "Jordi",
+        "person": "James",
         "role": "ampliaciones y renovaciones",
         "keywords": ["ampliar", "más vacantes", "añadir", "upgrade", "renovar",
                      "subir plan", "upsell", "más volumen"],
@@ -90,7 +94,7 @@ DIRECTORY = [
     },
     {
         "department": "General",
-        "person": "Recepción",
+        "person": "James",
         "role": "recepción general (fallback cuando no hay gestor ni departamento claro)",
         "keywords": ["hablar con alguien", "recepción", "general", "no sé", "cualquiera"],
         "phone": JAMES,

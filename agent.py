@@ -343,6 +343,10 @@ class LanderAgent(Agent):
         self._clients = clients or []
         # Detected branch for the call log; set when a transfer happens.
         self.branch: str | None = None
+        # Idempotency guard: True mientras hay un traspaso en curso. El LLM a veces
+        # llama a transfer_to_human varias veces seguidas (marcaría al humano 2-3
+        # veces); con esto las repeticiones concurrentes se ignoran.
+        self._transferring: bool = False
 
     # --- Fallback: identificar a un cliente por email -----------------------
     @function_tool
@@ -396,6 +400,15 @@ class LanderAgent(Agent):
                 human doesn't have to ask them to repeat. E.g. "Empresa interesada
                 en el plan para 15 vacantes, urgencia alta."
         """
+        # Idempotencia: si ya hay un traspaso en marcha, no vuelvas a marcar al humano.
+        # (El LLM a veces repite la tool-call durante los ~30s de tono → 2-3 llamadas.)
+        if self._transferring:
+            print("[TRANSFER] ignorada llamada duplicada a transfer_to_human (una ya en curso)")
+            return (
+                "Ya estás conectando al llamante con una persona ahora mismo. NO vuelvas "
+                "a llamar a transfer_to_human; espera en silencio a que se complete."
+            )
+        self._transferring = True
         self.branch = department or "humano"
         dest = _resolve_dest(person, self._directory)
         print(f"[TRANSFER] -> {department}/{person} | dial {dest} | summary: {summary}")
@@ -430,6 +443,9 @@ class LanderAgent(Agent):
                 instructions=whisper_instructions,
             )
         except Exception as exc:  # noqa: BLE001 — no contestan / buzón / rechazo / error SIP
+            # Falló (no contestan / buzón / rechazo / SIP): liberamos el guard para que,
+            # si el llamante lo vuelve a pedir explícitamente, se pueda reintentar.
+            self._transferring = False
             msg = str(exc)
             print(f"[TRANSFER] failed: {exc!r}")
             if "declined to connect" in msg:
