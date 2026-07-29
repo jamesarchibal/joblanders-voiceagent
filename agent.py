@@ -63,11 +63,21 @@ ELEVEN_VOICE_ID_EN = os.getenv("ELEVENLABS_VOICE_ID_EN") or "sXhK0yDKboLJMlkKubg
 VOICE_BY_LANG = {"ca": ELEVEN_VOICE_ID_CA, "en": ELEVEN_VOICE_ID_EN}
 # Warm transfer: dial a human via the netelip SIP outbound trunk (created in LiveKit Cloud).
 OUTBOUND_TRUNK = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK") or "ST_sk7yUi8zGoGz"
-# netelip rejects the E.164 "+" with a SIP 404; it wants the international "00" prefix
-# (e.g. +34623004169 -> 0034623004169). Normalise so config can still hold the "+" form.
-TRANSFER_NUMBER = (os.getenv("TRANSFER_NUMBER") or "+34623004169").strip()
-if TRANSFER_NUMBER.startswith("+"):
-    TRANSFER_NUMBER = "00" + TRANSFER_NUMBER[1:]
+# netelip wants the SPANISH NATIONAL 9-digit number (e.g. 623004169), NOT E.164.
+# Tested against sip.netelip.com: 0034623004169 -> SIP 503, 34623004169 -> 603 Declined,
+# 623004169 -> connects/rings. So strip any +34 / 0034 / 34 country prefix down to national.
+def _netelip_national(phone: str) -> str:
+    """Normalise a number to netelip's Spanish national 9-digit form (strip +34/0034/34)."""
+    t = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if t.startswith("0034"):
+        t = t[4:]
+    elif t.startswith("34") and len(t) > 9:
+        t = t[2:]
+    return t
+
+
+# Config can still hold the "+" form; we normalise here.
+TRANSFER_NUMBER = _netelip_national(os.getenv("TRANSFER_NUMBER") or "+34623004169")
 # Tuned to sound human, not robotic (turbo model + these settings, chosen by A/B on real samples):
 # lower stability = more natural intonation; high similarity = closer to the cloned voice; some style.
 # These are DEFAULTS; the dashboard (Parámetros tab) can override each at call start.
@@ -234,7 +244,7 @@ def _directory_block(directory: list[dict]) -> str:
 def _resolve_dest(person: str | None, directory: list[dict]) -> str:
     """Phone to dial for the chosen person (from the directory); fallback = TRANSFER_NUMBER.
 
-    Numbers are normalised to netelip's "00" prefix (it rejects the "+" with a 404).
+    Numbers are normalised to netelip's Spanish national 9-digit form (it rejects +34/0034).
     Today every directory row points at the same number, so all transfers still ring
     James — but this real-life-tests that Lander picks the right person/department.
     """
@@ -242,7 +252,7 @@ def _resolve_dest(person: str | None, directory: list[dict]) -> str:
         if str(d.get("person", "")).strip().lower() == (person or "").strip().lower():
             ph = str(d.get("phone") or "").strip()
             if ph:
-                return "00" + ph[1:] if ph.startswith("+") else ph
+                return _netelip_national(ph)
             break
     return TRANSFER_NUMBER
 
