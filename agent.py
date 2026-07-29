@@ -310,9 +310,25 @@ class _LanderWarmTransfer(WarmTransferTask):
         if self._human_agent_sess is not None:
             # Margen breve para que el track de audio del humano quede suscrito antes
             # de hablar (si no, se pierde el arranque de la frase).
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.3)
+            # Frase fija e instantánea (arranca TTS en ~75ms) para no dejar silencio
+            # muerto mientras el LLM genera el resumen. El humano acaba de descolgar
+            # una llamada que le hemos hecho, así que espera oír algo de inmediato.
             with contextlib.suppress(Exception):
-                self._human_agent_sess.generate_reply()
+                await self._human_agent_sess.say(
+                    "Hola, soy Lander, de Joblanders. Tengo una llamada para pasarte, "
+                    "dame un segundo."
+                )
+            # El resumen real lo genera el LLM; le decimos que YA ha saludado para que
+            # no repita el saludo y vaya directo al resumen y a pedir permiso.
+            with contextlib.suppress(Exception):
+                self._human_agent_sess.generate_reply(
+                    instructions=(
+                        "Ya has saludado y dicho que tienes una llamada para pasar. "
+                        "Ahora, sin volver a saludar, resume en una frase de qué ha "
+                        "hablado el llamante y pídele permiso para pasarle la llamada."
+                    )
+                )
 
     async def _merge_calls(self) -> None:
         # Paramos la música de espera y reactivamos el audio del llamante para que
