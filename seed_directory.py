@@ -59,9 +59,13 @@ CLIENTS = [
 # transferencias marcan su número. Se mantienen los departamentos + keywords para el
 # enrutado; cuando haya equipo real, sustituir cada `person`/`phone` por la persona
 # y número correctos.
+# Departamentos alineados con los modos internos del agente (Ventas / Soporte /
+# General) para que el traspaso a HUMANO caiga en el equipo que corresponde al modo
+# en que terminó la llamada. TODO: sustituir cada `phone` por el número real del
+# equipo cuando lo haya (hoy todos marcan a James).
 DIRECTORY = [
     {
-        "department": "Cuentas",
+        "department": "Soporte",
         "person": "James",
         "role": "incidencias técnicas y acceso",
         "keywords": ["no puedo entrar", "error", "bug", "acceso", "la app no va",
@@ -69,7 +73,7 @@ DIRECTORY = [
         "phone": JAMES,
     },
     {
-        "department": "Cuentas",
+        "department": "Soporte",
         "person": "James",
         "role": "cuenta y facturación",
         "keywords": ["factura", "pago", "cobro", "cuenta", "suscripción", "baja",
@@ -77,7 +81,7 @@ DIRECTORY = [
         "phone": JAMES,
     },
     {
-        "department": "Comercial",
+        "department": "Ventas",
         "person": "James",
         "role": "nuevas empresas",
         "keywords": ["contratar", "empezar", "nuevo", "precio", "demo", "interesado",
@@ -85,7 +89,7 @@ DIRECTORY = [
         "phone": JAMES,
     },
     {
-        "department": "Comercial",
+        "department": "Ventas",
         "person": "James",
         "role": "ampliaciones y renovaciones",
         "keywords": ["ampliar", "más vacantes", "añadir", "upgrade", "renovar",

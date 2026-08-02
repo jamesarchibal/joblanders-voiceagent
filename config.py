@@ -23,7 +23,19 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY
 
 @dataclass
 class RemoteConfig:
-    prompt: str | None = None
+    prompt: str | None = None  # base compartida (system_prompt) para los tres modos
+    # Bloques de rol por modo (Recepción / Ventas / Soporte). Se anexan a la base;
+    # si no hay override en el dashboard, el agente usa los ficheros prompts/role_*_es.md.
+    prompt_recepcion: str | None = None
+    prompt_ventas: str | None = None
+    prompt_soporte: str | None = None
+    # Enrutado: "unified" = un número, Recepción triajea y pasa (invisible) a
+    # Ventas/Soporte como subagentes; "separate" = 3 agentes independientes, cada
+    # uno con su número (DID) y su nombre, sin triaje ni cambio de modo.
+    routing_mode: str = "unified"
+    # Config por agente/modo: {role: {"name": str, "phone": str, "enabled": bool}}.
+    # `phone` es el DID entrante que arranca directamente ese modo en "separate".
+    agents: dict = field(default_factory=dict)
     knowledge: list[dict] = field(default_factory=list)  # [{id, topic, answer}, ...]
     params: dict[str, float] = field(default_factory=dict)  # {PARAM_ID: value}
     transfer_script: str | None = None  # guion del agente-susurro (traspaso a humano)
@@ -64,6 +76,16 @@ def load_config() -> RemoteConfig:
     if isinstance(sp.get("text"), str) and sp["text"].strip():
         cfg.prompt = sp["text"]
 
+    # Per-mode role blocks (optional dashboard overrides of prompts/role_*_es.md).
+    for role, attr in (
+        ("prompt_recepcion", "prompt_recepcion"),
+        ("prompt_ventas", "prompt_ventas"),
+        ("prompt_soporte", "prompt_soporte"),
+    ):
+        rp = by_key.get(role) or {}
+        if isinstance(rp.get("text"), str) and rp["text"].strip():
+            setattr(cfg, attr, rp["text"])
+
     kb = by_key.get("knowledge") or {}
     if isinstance(kb.get("facts"), list):
         cfg.knowledge = [f for f in kb["facts"] if isinstance(f, dict)]
@@ -90,10 +112,23 @@ def load_config() -> RemoteConfig:
     if isinstance(dr.get("people"), list):
         cfg.directory = [d for d in dr["people"] if isinstance(d, dict)]
 
+    ag = by_key.get("agents") or {}
+    if ag.get("mode") in ("unified", "separate"):
+        cfg.routing_mode = ag["mode"]
+    if isinstance(ag.get("list"), list):
+        for a in ag["list"]:
+            if isinstance(a, dict) and isinstance(a.get("role"), str):
+                cfg.agents[a["role"]] = {
+                    "name": str(a.get("name") or ""),
+                    "phone": str(a.get("phone") or ""),
+                    "enabled": bool(a.get("enabled", True)),
+                }
+
     print(
         f"[CONFIG] loaded from Supabase: prompt={'yes' if cfg.prompt else 'no'} "
         f"knowledge={len(cfg.knowledge)} params={len(cfg.params)} "
         f"transfer_script={'yes' if cfg.transfer_script else 'no'} "
-        f"clients={len(cfg.clients)} directory={len(cfg.directory)}"
+        f"clients={len(cfg.clients)} directory={len(cfg.directory)} "
+        f"routing={cfg.routing_mode} agents={len(cfg.agents)}"
     )
     return cfg

@@ -1,11 +1,15 @@
-"""Joblanders inbound voice agent — Milestone 0/1.
+"""Joblanders inbound voice agent — master receptionist + invisible sub-modes.
 
-Cascaded pipeline: Deepgram (STT) -> Claude (brain) -> Cartesia (TTS),
+Cascaded pipeline: Deepgram (STT) -> Claude (brain) -> ElevenLabs (TTS),
 orchestrated by LiveKit Agents with semantic turn detection + barge-in.
 
-One brain (Haiku by default) handles GREET -> CLASSIFY -> {support, sales, human}.
-The per-turn router (Haiku <-> Sonnet) comes in a later milestone; keeping it to
-one model first so the loop is simple and easy to make feel human.
+One Lander, one voice, one call — three modes. It starts in **Recepción** (the
+master/triage mode), understands why the caller is phoning in 1-2 questions, then
+hands off INVISIBLY (same voice, no announcement) to **Ventas** or **Soporte**,
+carrying the full conversation memory (chat_ctx). The caller never perceives the
+switch. A real human warm-transfer (transfer_to_human) stays as the last-resort
+fallback. Handoff = a @function_tool returning the next Agent; on_enter then
+continues the conversation seamlessly.
 
 Run:
     python agent.py console      # local mic/speakers, no phone, no LiveKit keys
@@ -16,10 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -33,6 +40,7 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    metrics,
 )
 from livekit.agents.beta.workflows import WarmTransferTask
 from livekit.plugins import anthropic, deepgram, elevenlabs, silero
@@ -44,6 +52,13 @@ from config import load_config
 load_dotenv(override=True)
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "system_es.md"
+# Per-mode role blocks appended to the shared base. One Lander, three modes:
+# Recepción (triage) -> invisible handoff -> Ventas / Soporte, same voice, same call.
+ROLE_PROMPT_PATHS = {
+    "recepcion": Path(__file__).parent / "prompts" / "role_recepcion_es.md",
+    "ventas": Path(__file__).parent / "prompts" / "role_ventas_es.md",
+    "soporte": Path(__file__).parent / "prompts" / "role_soporte_es.md",
+}
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
 STT_MODEL = os.getenv("STT_MODEL", "nova-3")
 TTS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
@@ -90,6 +105,23 @@ DEFAULTS = {
     "FALSE_INTERRUPTION_TIMEOUT": float(os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0")),
     "MIN_ENDPOINTING_DELAY": float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4")),
 }
+
+
+def _handoff_turn_spoke(chat_ctx) -> bool:
+    """True if the agent that just handed off SPOKE on the handoff turn (e.g. Recepción
+    asked a qualifying question) rather than switching silently.
+
+    Used by the destination mode's on_enter to decide whether to auto-reply: if the
+    previous mode just asked something, the floor is with the caller, so we stay quiet
+    (no talking over). If the handoff was silent, we reply to avoid dead air.
+    """
+    try:
+        for msg in reversed(list(chat_ctx.messages())):
+            if msg.role == "assistant":
+                return bool(msg.text_content and msg.text_content.strip())
+    except Exception:  # noqa: BLE001 — never let this gate break a handoff
+        return False
+    return False
 
 
 def _format_history_es(chat_ctx) -> str:
@@ -148,30 +180,214 @@ def _recall_block(prior: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# Palabras vacías (es) + genéricas que no deben disparar un match de KB. Las de <3
+# letras se descartan siempre; estas cubren las de 3+ que aún son ruido.
+_KB_STOP = {
+    "que", "como", "cual", "cuales", "donde", "para", "por", "con", "sin",
+    "los", "las", "del", "una", "uno", "unos", "unas", "mis", "tus", "sus",
+    "esta", "este", "esto", "eso", "esa", "ese", "mas", "muy", "hay", "son",
+    "pero", "aqui", "ahi", "desde", "hacia", "sobre", "cuando", "porque",
+    "quiero", "puedo", "puede", "tengo", "necesito", "favor", "porfa", "hola",
+    "quisiera", "podria", "vale", "gracias", "sabes", "dime", "algo", "cosa",
+}
+
+
+def _kb_tokens(s: str) -> set[str]:
+    """Tokens significativos de un texto: sin acentos, >=3 letras, sin stopwords."""
+    import re
+    import unicodedata
+
+    norm = unicodedata.normalize("NFKD", (s or "").lower())
+    norm = "".join(c for c in norm if not unicodedata.combining(c))
+    return {w for w in re.findall(r"[a-z0-9]+", norm) if len(w) >= 3 and w not in _KB_STOP}
+
+
 def _match_knowledge(topic: str, knowledge: list[dict], category: str) -> dict | None:
     """Match a caller topic against the editable KB facts of ONE category.
 
     The dashboard splits knowledge into "sales" (quoted to new clients) and
     "support" (quoted to existing clients). A fact with no category is treated as
-    "sales" for backward-compat. Returns the tool-result dict on a hit (found or a
-    not-public sentinel), or None if nothing in this category matched (caller then
-    falls back to the baked-in knowledge module).
+    "sales" for backward-compat. Ranks facts by how many MEANINGFUL tokens overlap
+    (whole words, accent-insensitive) so short stopwords like "es"/"no" can't
+    false-match; the best-scoring fact wins (ties broken by order). Returns the
+    tool-result dict on a hit (found or a not-public sentinel), or None if nothing
+    overlapped (caller then falls back to the baked-in knowledge module).
     """
-    topic_l = (topic or "").lower()
+    caller = _kb_tokens(topic)
+    if not caller:
+        return None
+    best: dict | None = None
+    best_score = 0
     for fact in knowledge:
         if (fact.get("category") or "sales") != category:
             continue
-        hay = f"{fact.get('topic', '')} {fact.get('id', '')}".lower()
-        if any(w and w in hay for w in topic_l.split()):
-            answer = str(fact.get("answer", ""))
-            if "PENDIENTE_DEFINIR" in answer:
-                return {
-                    "found": False,
-                    "reason": "not_public",
-                    "say": answer.split("—", 1)[-1].strip() or answer,
-                }
-            return {"found": True, "topic": fact.get("topic"), "answer": answer}
-    return None
+        score = len(caller & _kb_tokens(f"{fact.get('topic', '')} {fact.get('id', '')}"))
+        if score > best_score:
+            best_score, best = score, fact
+    if best is None:
+        return None
+    answer = str(best.get("answer", ""))
+    if "PENDIENTE_DEFINIR" in answer:
+        return {
+            "found": False,
+            "reason": "not_public",
+            "say": answer.split("—", 1)[-1].strip() or answer,
+        }
+    return {"found": True, "topic": best.get("topic"), "answer": answer}
+
+
+def _crm_log_lead(payload: dict) -> dict:
+    """Insert one qualified inbound lead into the dashboard lab CRM (crm_companies,
+    business='lab'). Blocking urllib POST — call via asyncio.to_thread. Best-effort:
+    returns {"ok": bool, ...}, never raises.
+    """
+    import urllib.request
+
+    from config import SUPABASE_KEY, SUPABASE_URL
+
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return {"ok": False, "reason": "no_supabase_creds"}
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/crm_companies",
+        data=json.dumps([payload]).encode("utf-8"),
+        method="POST",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310 (trusted URL)
+            return {"ok": 200 <= resp.status < 300, "status": resp.status}
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully; the call goes on
+        return {"ok": False, "reason": repr(exc)}
+
+
+def _ticket_create(payload: dict) -> dict:
+    """Insert one support ticket into the dashboard (landeros_tickets). Blocking
+    urllib POST — call via asyncio.to_thread. Best-effort: returns {"ok": bool, ...},
+    never raises.
+    """
+    import urllib.request
+
+    from config import SUPABASE_KEY, SUPABASE_URL
+
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return {"ok": False, "reason": "no_supabase_creds"}
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/landeros_tickets",
+        data=json.dumps([payload]).encode("utf-8"),
+        method="POST",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310 (trusted URL)
+            return {"ok": 200 <= resp.status < 300, "status": resp.status}
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully; the call goes on
+        return {"ok": False, "reason": repr(exc)}
+
+
+# --- Google Calendar auto-booking (SDR demos) -------------------------------
+# The service account uses domain-wide delegation to act as GCAL_SUBJECT and drop
+# demo events on the "Entrevistas" calendar. Creds arrive as a base64 secret so we
+# never commit the JSON. All best-effort: missing creds -> the tool declines cleanly.
+_GCAL_CAL_ID = (
+    os.getenv("GCAL_CALENDAR_ID")
+    or "c_5c4176e200265f1be45114e83f5f033285b78400281ee40e1639615a4e4a4924@group.calendar.google.com"
+)
+_GCAL_SUBJECT = os.getenv("GCAL_IMPERSONATE") or "james@joblanders.com"
+_GCAL_TZ = "Europe/Madrid"
+
+
+def _gcal_token() -> str | None:
+    """Mint a Calendar access token via the service account (domain-wide delegation,
+    impersonating _GCAL_SUBJECT). Returns None if creds/libs are missing.
+    """
+    raw = os.getenv("GOOGLE_SA_JSON_B64")
+    if not raw:
+        return None
+    try:
+        import base64
+
+        from google.auth.transport.requests import Request as _GReq
+        from google.oauth2 import service_account
+
+        info = json.loads(base64.b64decode(raw))
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/calendar"], subject=_GCAL_SUBJECT,
+        )
+        creds.refresh(_GReq())
+        return creds.token
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CAL] token error: {exc!r}")
+        return None
+
+
+def _gcal_book_demo(payload: dict) -> dict:
+    """Book a demo on the Entrevistas calendar (impersonated). payload keys:
+    summary, description, start_iso, end_iso, attendee (optional email).
+    Checks freebusy for the window first and refuses if busy. Never raises.
+    """
+    import urllib.parse
+    import urllib.request
+
+    token = _gcal_token()
+    if not token:
+        return {"ok": False, "reason": "no_gcal_creds"}
+    hdr = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # 1) Is the requested window free?
+    try:
+        fb_body = {
+            "timeMin": payload["start_iso"],
+            "timeMax": payload["end_iso"],
+            "timeZone": _GCAL_TZ,
+            "items": [{"id": _GCAL_CAL_ID}],
+        }
+        fb_req = urllib.request.Request(
+            "https://www.googleapis.com/calendar/v3/freeBusy",
+            data=json.dumps(fb_body).encode("utf-8"),
+            method="POST",
+            headers=hdr,
+        )
+        with urllib.request.urlopen(fb_req, timeout=8) as resp:  # noqa: S310
+            fb = json.loads(resp.read())
+        if fb.get("calendars", {}).get(_GCAL_CAL_ID, {}).get("busy", []):
+            return {"ok": False, "reason": "busy"}
+    except Exception as exc:  # noqa: BLE001 — fail closed, never double-book blindly
+        print(f"[CAL] freebusy error: {exc!r}")
+        return {"ok": False, "reason": f"freebusy:{exc!r}"}
+
+    # 2) Insert the event.
+    event = {
+        "summary": payload["summary"],
+        "description": payload.get("description", ""),
+        "start": {"dateTime": payload["start_iso"], "timeZone": _GCAL_TZ},
+        "end": {"dateTime": payload["end_iso"], "timeZone": _GCAL_TZ},
+    }
+    if payload.get("attendee"):
+        event["attendees"] = [{"email": payload["attendee"]}]
+    try:
+        cal = urllib.parse.quote(_GCAL_CAL_ID)
+        ins_req = urllib.request.Request(
+            f"https://www.googleapis.com/calendar/v3/calendars/{cal}/events?sendUpdates=all",
+            data=json.dumps(event).encode("utf-8"),
+            method="POST",
+            headers=hdr,
+        )
+        with urllib.request.urlopen(ins_req, timeout=8) as resp:  # noqa: S310
+            created = json.loads(resp.read())
+        return {"ok": True, "id": created.get("id"), "htmlLink": created.get("htmlLink")}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CAL] insert error: {exc!r}")
+        return {"ok": False, "reason": f"insert:{exc!r}"}
 
 
 def _person_dept(person: str | None, directory: list[dict]) -> str | None:
@@ -348,31 +564,95 @@ class _LanderWarmTransfer(WarmTransferTask):
         await super()._merge_calls()
 
 
-class LanderAgent(Agent):
-    def __init__(
-        self,
-        instructions: str,
-        knowledge: list[dict] | None = None,
-        transfer_script: str | None = None,
-        directory: list[dict] | None = None,
-        clients: list[dict] | None = None,
-    ) -> None:
-        super().__init__(instructions=instructions)
+@dataclass
+class _CallState:
+    """Estado mutable compartido por los tres modos durante UNA llamada.
+
+    Como el modo (Recepción → Ventas/Soporte) puede cambiar a mitad de llamada,
+    la rama detectada y el guard de traspaso viven aquí, no en una instancia de
+    agente concreta: así el log de la llamada lee la rama final sin importar en
+    qué modo terminó, y el guard de idempotencia del traspaso a humano se respeta
+    aunque el traspaso se pida desde un modo distinto al inicial.
+    """
+
+    branch: str | None = None
+    transferring: bool = False
+    # True cuando la llamada arranca directamente en Ventas/Soporte por su propio
+    # número (routing_mode="separate"): sin Recepción, sin triaje y sin cambio de
+    # modo. Los agentes usan este flag para no re-saludar ni cruzar de modo.
+    standalone: bool = False
+
+
+@dataclass
+class _Bundle:
+    """Todo lo que cada modo necesita para construirse (prompt + datos de la llamada).
+
+    Se crea una sola vez en el entrypoint y se comparte entre los tres modos, de
+    modo que un cambio de modo (handoff) reconstruye el prompt del nuevo modo sin
+    volver a leer config ni CRM: solo cambia el bloque «# Tu rol ahora».
+    """
+
+    base_prompt: str
+    role_prompts: dict  # {"recepcion": str, "ventas": str, "soporte": str}
+    caller_context: str
+    recall_block: str
+    directory_block: str
+    knowledge: list = field(default_factory=list)
+    transfer_script: str | None = None
+    directory: list = field(default_factory=list)
+    clients: list = field(default_factory=list)
+    state: _CallState = field(default_factory=_CallState)
+    # Enrutado de la llamada: "unified" (Recepción + subagentes) | "separate".
+    routing_mode: str = "unified"
+    # Nombre con el que abre el agente en el saludo (por defecto Lander). En modo
+    # "separate" cada agente puede tener su propio nombre configurado.
+    agent_name: str = "Lander"
+    # Caller-ID entrante (para registrar el teléfono al loguear un lead en el CRM).
+    caller: str | None = None
+
+    def instructions_for(self, role: str) -> str:
+        now = datetime.now(ZoneInfo("Europe/Madrid"))
+        date_line = (
+            f"Contexto temporal: hoy es {now:%Y-%m-%d} ({now:%A}), "
+            f"hora local {now:%H:%M} (Europe/Madrid). Úsalo para interpretar "
+            "fechas relativas ('mañana', 'el martes') al agendar."
+        )
+        parts = [self.base_prompt, self.role_prompts.get(role, ""), self.caller_context, date_line]
+        if self.recall_block:
+            parts.append(self.recall_block)
+        if self.directory_block:
+            parts.append(self.directory_block)
+        return "\n\n".join(p for p in parts if p and p.strip())
+
+
+class _BaseLanderAgent(Agent):
+    """Base común de los tres modos de Lander.
+
+    Un solo agente, una sola voz, una sola llamada: empieza en Recepción y cambia
+    de modo de forma invisible a Ventas/Soporte llevándose la memoria de la
+    conversación (chat_ctx). Aquí viven las tools compartidas por todos los modos:
+    identificar a un cliente por email y el traspaso REAL a un humano (fallback).
+    Cada modo fija su `role` y añade sus propias tools.
+    """
+
+    role: str = "recepcion"
+
+    def __init__(self, bundle: _Bundle, chat_ctx=None) -> None:
+        # chat_ctx: al cambiar de modo pasamos el histórico del modo anterior para
+        # que el nuevo modo continúe la conversación sin que el llamante note nada.
+        super().__init__(instructions=bundle.instructions_for(self.role), chat_ctx=chat_ctx)
+        self._bundle = bundle
         # Optional per-call knowledge from the dashboard; falls back to knowledge.py.
-        self._knowledge = knowledge or []
+        self._knowledge = bundle.knowledge or []
         # Guion del traspaso editable desde el dashboard; si no, el default de arriba.
-        self._transfer_script = transfer_script or DEFAULT_TRANSFER_SCRIPT
+        self._transfer_script = bundle.transfer_script or DEFAULT_TRANSFER_SCRIPT
         # Directorio de transferencia (departamentos/personas/teléfonos) para enrutar.
-        self._directory = directory or []
+        self._directory = bundle.directory or []
         # Lista de clientes (CRM del dashboard) para el fallback de identificación por
         # email cuando el número no coincide o llega oculto.
-        self._clients = clients or []
-        # Detected branch for the call log; set when a transfer happens.
-        self.branch: str | None = None
-        # Idempotency guard: True mientras hay un traspaso en curso. El LLM a veces
-        # llama a transfer_to_human varias veces seguidas (marcaría al humano 2-3
-        # veces); con esto las repeticiones concurrentes se ignoran.
-        self._transferring: bool = False
+        self._clients = bundle.clients or []
+        # Estado mutable compartido (rama detectada + guard de traspaso).
+        self._state = bundle.state
 
     # --- Fallback: identificar a un cliente por email -----------------------
     @function_tool
@@ -428,14 +708,14 @@ class LanderAgent(Agent):
         """
         # Idempotencia: si ya hay un traspaso en marcha, no vuelvas a marcar al humano.
         # (El LLM a veces repite la tool-call durante los ~30s de tono → 2-3 llamadas.)
-        if self._transferring:
+        if self._state.transferring:
             print("[TRANSFER] ignorada llamada duplicada a transfer_to_human (una ya en curso)")
             return (
                 "Ya estás conectando al llamante con una persona ahora mismo. NO vuelvas "
                 "a llamar a transfer_to_human; espera en silencio a que se complete."
             )
-        self._transferring = True
-        self.branch = department or "humano"
+        self._state.transferring = True
+        self._state.branch = department or "humano"
         dest = _resolve_dest(person, self._directory)
         print(f"[TRANSFER] -> {department}/{person} | dial {dest} | summary: {summary}")
 
@@ -471,7 +751,7 @@ class LanderAgent(Agent):
         except Exception as exc:  # noqa: BLE001 — no contestan / buzón / rechazo / error SIP
             # Falló (no contestan / buzón / rechazo / SIP): liberamos el guard para que,
             # si el llamante lo vuelve a pedir explícitamente, se pueda reintentar.
-            self._transferring = False
+            self._state.transferring = False
             msg = str(exc)
             print(f"[TRANSFER] failed: {exc!r}")
             if "declined to connect" in msg:
@@ -511,6 +791,32 @@ class LanderAgent(Agent):
             "¡que vaya muy bien!'). No hagas preguntas ni añadas nada más."
         )
 
+
+class VentasAgent(_BaseLanderAgent):
+    """Modo VENTAS: descubre necesidad, presenta el producto y cierra con Comercial.
+
+    Se entra aquí desde Recepción (o corrigiendo desde Soporte) llevándose el
+    histórico; para el llamante es la misma persona sin cortes.
+    """
+
+    role = "ventas"
+
+    async def on_enter(self) -> None:
+        # Modo "separate": este agente es el PRIMER contacto (su propio número), así
+        # que el saludo estático del entrypoint (nombre + aviso de IA) abre la
+        # llamada; no generamos respuesta aquí para no duplicar la apertura.
+        if self._state.standalone:
+            return
+        # Transición invisible: en cuanto tomamos el control, respondemos al último
+        # turno del llamante ya en modo Ventas (con las tools/mensaje de ventas),
+        # sin volver a saludar. generate_reply() usa el chat_ctx heredado.
+        # PERO si Recepción acaba de hablar en el turno del handoff (p.ej. hizo una
+        # pregunta de calificación mientras se hacía el cambio), el turno es del
+        # llamante: nos callamos y esperamos su respuesta para no hablar encima.
+        if _handoff_turn_spoke(self.chat_ctx):
+            return
+        self.session.generate_reply()
+
     # --- Sales: product/plan facts ------------------------------------------
     @function_tool
     async def get_product_info(self, context: RunContext, topic: str) -> dict:
@@ -534,6 +840,147 @@ class LanderAgent(Agent):
         from knowledge import get_product_info
 
         return get_product_info(topic)
+
+    # --- Sales: registrar un lead cualificado en el lab CRM -----------------
+    @function_tool
+    async def log_lead(
+        self, context: RunContext, empresa: str, contacto: str = "", necesidad: str = "",
+    ) -> dict:
+        """Registra un lead CUALIFICADO en el CRM (empresa nueva interesada en joblanders.ai).
+
+        Llámala SOLO cuando: es una empresa nueva (no un cliente existente), te ha
+        dado el NOMBRE de su empresa, y muestra interés real (quiere info, una demo,
+        o avanzar). NO la llames sin interés, ni sin el nombre de la empresa. Una
+        sola vez por llamada. No le anuncies al llamante que lo apuntas en un CRM;
+        simplemente continúa la conversación con normalidad.
+
+        Args:
+            empresa: Nombre de la empresa del llamante. Obligatorio.
+            contacto: Nombre de la persona que llama, si lo da.
+            necesidad: Una frase (en español) con lo que busca / su caso —tipo de
+                agencia, volumen, qué quiere automatizar— para que Comercial lo retome.
+        """
+        empresa = (empresa or "").strip()
+        if not empresa:
+            return {"logged": False, "say": "Pídele el nombre de su empresa antes de registrar."}
+        caller_phone = getattr(self._bundle, "caller", None) or ""
+        payload = {
+            "name": empresa,
+            "business": "lab",
+            "source": "voice",
+            "relationship": "prospecto",
+            "stage": "Contactado",
+            "contact_name": (contacto or "").strip(),
+            "contact_phone": caller_phone,
+            "notes": (necesidad or "").strip(),
+            "next_action": "Llamada entrante cualificada por Lander — retomar desde Comercial",
+        }
+        res = await asyncio.to_thread(_crm_log_lead, payload)
+        if res.get("ok"):
+            print(f"[LEAD] logged empresa={empresa!r} phone={caller_phone!r}")
+            return {"logged": True}
+        print(f"[LEAD] FAILED empresa={empresa!r} -> {res}")
+        return {"logged": False}
+
+    # --- Sales: agendar una demo en el calendario de Comercial --------------
+    @function_tool
+    async def book_demo(
+        self,
+        context: RunContext,
+        empresa: str,
+        fecha_hora_iso: str,
+        email: str = "",
+        contacto: str = "",
+        duracion_min: int = 30,
+    ) -> dict:
+        """Agenda una DEMO de joblanders.ai en el calendario de Comercial.
+
+        Llámala cuando la persona quiere una demo y ya tienes: nombre de su EMPRESA
+        y una FECHA/HORA concreta que prefiera (pídele también un email para enviarle
+        la invitación). Convierte la hora que te diga a formato ISO local, p.ej.
+        "el martes a las cuatro" -> "2026-08-05T16:00:00", usando la fecha de HOY del
+        contexto temporal. Confirma en voz SOLO el hueco que devuelva la herramienta;
+        si devuelve ocupado, propón otra hora y vuelve a llamarla. Nunca inventes ni
+        confirmes un hueco sin llamar a la herramienta. Una demo por llamada.
+
+        Args:
+            empresa: Nombre de la empresa. Obligatorio.
+            fecha_hora_iso: Inicio en ISO local "YYYY-MM-DDTHH:MM:SS". Obligatorio.
+            email: Email de contacto para enviarle la invitación.
+            contacto: Nombre de la persona que llama, si lo da.
+            duracion_min: Duración en minutos (por defecto 30).
+        """
+        empresa = (empresa or "").strip()
+        start_raw = (fecha_hora_iso or "").strip()
+        if not empresa or not start_raw:
+            return {"booked": False, "say": "Necesito el nombre de la empresa y una fecha y hora concreta."}
+        try:
+            start_dt = datetime.fromisoformat(start_raw)
+        except ValueError:
+            return {"booked": False, "say": "No entendí la fecha; pídela de nuevo con día y hora."}
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=ZoneInfo("Europe/Madrid"))
+        end_dt = start_dt + timedelta(minutes=max(15, int(duracion_min or 30)))
+        caller_phone = getattr(self._bundle, "caller", None) or ""
+        desc = [f"Empresa: {empresa}"]
+        if contacto:
+            desc.append(f"Contacto: {contacto}")
+        if caller_phone:
+            desc.append(f"Teléfono: {caller_phone}")
+        desc.append("Demo agendada por Lander (agente de voz de entrada).")
+        payload = {
+            "summary": f"Demo joblanders.ai — {empresa}",
+            "description": "\n".join(desc),
+            "start_iso": start_dt.isoformat(),
+            "end_iso": end_dt.isoformat(),
+            "attendee": (email or "").strip() or None,
+        }
+        res = await asyncio.to_thread(_gcal_book_demo, payload)
+        if res.get("ok"):
+            print(f"[DEMO] booked empresa={empresa!r} at={start_dt.isoformat()}")
+            return {"booked": True, "cuando": start_dt.isoformat()}
+        if res.get("reason") == "busy":
+            return {"booked": False, "motivo": "ocupado", "say": "Ese hueco está ocupado; propón otra hora."}
+        print(f"[DEMO] FAILED empresa={empresa!r} -> {res}")
+        return {"booked": False, "say": "No he podido agendarlo ahora; ofrécele que Comercial le llame."}
+
+    # --- Corrección: en realidad era soporte --------------------------------
+    @function_tool
+    async def pasar_a_soporte(self, context: RunContext) -> Agent:
+        """Cambia INTERNAMENTE al modo Soporte, de forma invisible para el llamante.
+
+        Úsala solo si, ya en Ventas, descubres que en realidad es un cliente
+        existente con una duda de soporte (uso, acceso, cuenta, incidencia). NO
+        anuncies el cambio ni te vuelvas a presentar: el llamante debe percibir la
+        misma conversación. Se lleva la memoria de lo hablado.
+        """
+        if self._state.standalone:
+            return (
+                "Eres un agente independiente de Ventas; no cambies de modo. Ayuda "
+                "en lo que puedas o pasa con una persona con transfer_to_human."
+            )
+        self._state.branch = "soporte"
+        print("[HANDOFF] ventas -> soporte")
+        return SoporteAgent(self._bundle, chat_ctx=self.chat_ctx)
+
+
+class SoporteAgent(_BaseLanderAgent):
+    """Modo SOPORTE: resuelve dudas de clientes existentes con hechos aprobados,
+    consulta estados y, si hace falta, escala a la persona/gestor correcto.
+    """
+
+    role = "soporte"
+
+    async def on_enter(self) -> None:
+        # Modo "separate": primer contacto por su propio número; el saludo estático
+        # abre la llamada (ver VentasAgent.on_enter).
+        if self._state.standalone:
+            return
+        # Transición invisible (ver VentasAgent.on_enter). Si Recepción acaba de hablar
+        # en el turno del handoff, el turno es del llamante: nos callamos y esperamos.
+        if _handoff_turn_spoke(self.chat_ctx):
+            return
+        self.session.generate_reply()
 
     # --- Support: knowledge for existing clients ----------------------------
     @function_tool
@@ -571,6 +1018,178 @@ class LanderAgent(Agent):
         from knowledge import lookup_application_status
 
         return lookup_application_status(reference)
+
+    # --- Support: abrir un ticket de incidencia -----------------------------
+    @function_tool
+    async def create_ticket(
+        self,
+        context: RunContext,
+        asunto: str,
+        detalle: str = "",
+        prioridad: str = "media",
+        cliente: str = "",
+        contacto: str = "",
+    ) -> dict:
+        """Abre un TICKET de incidencia de soporte para un cliente existente.
+
+        Llámala cuando el cliente reporta un problema/incidencia que NO puedes
+        resolver en el momento con get_support_info y hay que dejar constancia para
+        que el equipo lo revise (un fallo, un error, algo no funciona, una queja).
+        Una sola vez por incidencia. Confirma en voz que has abierto el ticket SOLO
+        si la herramienta devuelve created=true. No la uses para dudas ya resueltas
+        ni para consultar estados (usa lookup_application_status para eso).
+
+        Args:
+            asunto: Título corto de la incidencia. Obligatorio.
+            detalle: Descripción de lo que falla, en español.
+            prioridad: baja | media | alta | urgente (por defecto media; usa alta o
+                urgente si es un bloqueo o una caída crítica).
+            cliente: Nombre de la empresa/cliente, si lo tienes.
+            contacto: Nombre de la persona que llama, si lo da.
+        """
+        asunto = (asunto or "").strip()
+        if not asunto:
+            return {"created": False, "say": "Necesito un asunto breve para abrir el ticket."}
+        prio = (prioridad or "media").strip().lower()
+        if prio not in ("baja", "media", "alta", "urgente"):
+            prio = "media"
+        caller_phone = getattr(self._bundle, "caller", None) or ""
+        payload = {
+            "cliente": (cliente or "").strip(),
+            "contacto": (contacto or "").strip(),
+            "phone": caller_phone,
+            "asunto": asunto,
+            "detalle": (detalle or "").strip(),
+            "prioridad": prio,
+            "source": "voice",
+        }
+        res = await asyncio.to_thread(_ticket_create, payload)
+        if res.get("ok"):
+            print(f"[TICKET] created asunto={asunto!r} prio={prio!r} phone={caller_phone!r}")
+            return {"created": True, "prioridad": prio}
+        print(f"[TICKET] FAILED asunto={asunto!r} -> {res}")
+        return {"created": False, "say": "No he podido abrir el ticket ahora; ofrécele que le llamemos."}
+
+    # --- Corrección: en realidad era ventas ---------------------------------
+    @function_tool
+    async def pasar_a_ventas(self, context: RunContext) -> Agent:
+        """Cambia INTERNAMENTE al modo Ventas, de forma invisible para el llamante.
+
+        Úsala solo si, ya en Soporte, descubres que en realidad es un cliente
+        nuevo con interés comercial. NO anuncies el cambio ni te vuelvas a
+        presentar. Se lleva la memoria de lo hablado.
+        """
+        if self._state.standalone:
+            return (
+                "Eres un agente independiente de Soporte; no cambies de modo. Ayuda "
+                "en lo que puedas o pasa con una persona con transfer_to_human."
+            )
+        self._state.branch = "ventas"
+        print("[HANDOFF] soporte -> ventas")
+        return VentasAgent(self._bundle, chat_ctx=self.chat_ctx)
+
+
+class RecepcionistaAgent(_BaseLanderAgent):
+    """Modo RECEPCIÓN (maestro): saluda, triajea el motivo en 1-2 preguntas y
+    cambia de modo de forma INVISIBLE a Ventas o Soporte. No responde el caso él
+    mismo; enruta. Mantiene el traspaso a humano como fallback (heredado).
+    """
+
+    role = "recepcion"
+
+    @function_tool
+    async def pasar_a_ventas(self, context: RunContext) -> Agent:
+        """Cambia INTERNAMENTE al modo Ventas, de forma invisible para el llamante.
+
+        Úsala en cuanto detectes interés comercial: posible cliente nuevo, precios,
+        producto, quiere contratar o ver una demo. NO digas que le pasas con nadie
+        ni te vuelvas a presentar: para el llamante sigues siendo la misma persona.
+        Se lleva toda la memoria de lo hablado.
+        """
+        self._state.branch = "ventas"
+        print("[HANDOFF] recepcion -> ventas")
+        return VentasAgent(self._bundle, chat_ctx=self.chat_ctx)
+
+    @function_tool
+    async def pasar_a_soporte(self, context: RunContext) -> Agent:
+        """Cambia INTERNAMENTE al modo Soporte, de forma invisible para el llamante.
+
+        Úsala en cuanto detectes soporte: cliente existente, no puede entrar, duda
+        de uso, cómo funciona, cuenta, facturación, estado de una candidatura o una
+        incidencia. NO digas que le pasas con nadie ni te vuelvas a presentar: para
+        el llamante sigues siendo la misma persona. Se lleva toda la memoria.
+        """
+        self._state.branch = "soporte"
+        print("[HANDOFF] recepcion -> soporte")
+        return SoporteAgent(self._bundle, chat_ctx=self.chat_ctx)
+
+
+def _load_role_prompts(cfg) -> dict:
+    """Bloque de rol por modo: override del dashboard si existe, si no el fichero local."""
+    overrides = {
+        "recepcion": getattr(cfg, "prompt_recepcion", None),
+        "ventas": getattr(cfg, "prompt_ventas", None),
+        "soporte": getattr(cfg, "prompt_soporte", None),
+    }
+    out: dict[str, str] = {}
+    for role, path in ROLE_PROMPT_PATHS.items():
+        text = overrides.get(role)
+        if not (isinstance(text, str) and text.strip()):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001 — a role file missing must never break the call
+                text = ""
+        out[role] = text
+    return out
+
+
+_ROLE_AGENTS = {
+    "recepcion": lambda b: RecepcionistaAgent(b),
+    "ventas": lambda b: VentasAgent(b),
+    "soporte": lambda b: SoporteAgent(b),
+}
+
+
+def _dialed_number(ctx) -> str | None:
+    """The DID (which of OUR numbers) the caller dialled, for separate-mode routing.
+
+    Read best-effort from the inbound SIP participant attributes; returns None if
+    unavailable (then we fall back to Recepción, i.e. unified behaviour).
+    """
+    try:
+        room = getattr(ctx, "room", None)
+        parts = list(getattr(room, "remote_participants", {}).values()) if room else []
+        for pt in parts:
+            attrs = getattr(pt, "attributes", {}) or {}
+            for k in ("sip.trunkPhoneNumber", "sip.trunk_phone_number", "sip.dialedNumber"):
+                v = attrs.get(k)
+                if v:
+                    return str(v)
+    except Exception:  # noqa: BLE001 — never let routing detection break the call
+        pass
+    return None
+
+
+def _starting_role(cfg, dialed: str | None) -> str:
+    """Which mode the call starts in.
+
+    "unified" (or anything unknown) always starts in Recepción. "separate" starts
+    directly in the mode whose configured number matches the dialled DID (last 9
+    digits); if nothing matches or it's disabled, fall back to Recepción.
+    """
+    if getattr(cfg, "routing_mode", "unified") != "separate":
+        return "recepcion"
+    if not dialed:
+        return "recepcion"
+    target = _last9(dialed)
+    if not target:
+        return "recepcion"
+    for role in ("ventas", "soporte", "recepcion"):
+        a = cfg.agents.get(role) or {}
+        ph = a.get("phone")
+        if ph and _last9(ph) == target and a.get("enabled", True):
+            return role
+    return "recepcion"
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -633,14 +1252,41 @@ async def entrypoint(ctx: JobContext) -> None:
     prior_calls = await asyncio.to_thread(fetch_prior_calls, caller)
     print(f"[RECALL] caller={caller!r} -> {len(prior_calls)} prior call(s)")
 
-    instructions = cfg.prompt or PROMPT_PATH.read_text(encoding="utf-8")
-    instructions = instructions + "\n\n" + _caller_context(client, cfg.directory)
+    # One Lander, three modes: build a shared bundle (base prompt + per-mode role
+    # blocks + this call's context) that every mode reuses when we hand off invisibly.
+    base_prompt = cfg.prompt or PROMPT_PATH.read_text(encoding="utf-8")
+    role_prompts = _load_role_prompts(cfg)
+    caller_context = _caller_context(client, cfg.directory)
     recall_block = _recall_block(prior_calls)
-    if recall_block:
-        instructions = instructions + "\n\n" + recall_block
     directory_block = _directory_block(cfg.directory)
-    if directory_block:
-        instructions = instructions + "\n\n" + directory_block
+
+    # Enrutado: en "separate", el número marcado (DID) arranca directamente en
+    # Ventas/Soporte (independiente, sin triaje). En "unified" siempre Recepción.
+    dialed = _dialed_number(ctx)
+    start_role = _starting_role(cfg, dialed)
+    standalone = cfg.routing_mode == "separate" and start_role != "recepcion"
+    agent_name = (cfg.agents.get(start_role) or {}).get("name") or "Lander"
+    print(
+        f"[ROUTING] mode={cfg.routing_mode} dialed={dialed!r} -> start_role={start_role} "
+        f"standalone={standalone} name={agent_name!r}"
+    )
+
+    state = _CallState(standalone=standalone, branch=start_role if standalone else None)
+    bundle = _Bundle(
+        base_prompt=base_prompt,
+        role_prompts=role_prompts,
+        caller_context=caller_context,
+        recall_block=recall_block,
+        directory_block=directory_block,
+        knowledge=cfg.knowledge,
+        transfer_script=cfg.transfer_script,
+        directory=cfg.directory,
+        clients=cfg.clients,
+        state=state,
+        routing_mode=cfg.routing_mode,
+        agent_name=agent_name,
+        caller=caller,
+    )
     voice_settings = elevenlabs.VoiceSettings(
         stability=p("ELEVENLABS_STABILITY"),
         similarity_boost=p("ELEVENLABS_SIMILARITY"),
@@ -678,13 +1324,10 @@ async def entrypoint(ctx: JobContext) -> None:
         min_endpointing_delay=p("MIN_ENDPOINTING_DELAY"),
     )
 
-    agent = LanderAgent(
-        instructions=instructions,
-        knowledge=cfg.knowledge,
-        transfer_script=cfg.transfer_script,
-        directory=cfg.directory,
-        clients=cfg.clients,
-    )
+    # Start in the routed mode. "unified" -> Recepción (master/triage), which hands
+    # off invisibly to Ventas/Soporte carrying the conversation memory (chat_ctx).
+    # "separate" -> straight into Ventas/Soporte for that number (standalone).
+    agent = _ROLE_AGENTS.get(start_role, _ROLE_AGENTS["recepcion"])(bundle)
 
     # Idioma bloqueado a español: Deepgram STT en language="es" y voz ES fija.
     # (Se retiró el auto-cambio de voz por idioma: en línea telefónica con ruido
@@ -702,6 +1345,25 @@ async def entrypoint(ctx: JobContext) -> None:
             if text:
                 transcript.append({"role": str(role), "text": str(text)})
         except Exception:  # noqa: BLE001 — never let logging break the call
+            pass
+
+    # Per-turn latency: emit one `[LATENCY]` JSON line per metrics event so a log
+    # parser (evals/latency.py) can report p50/p95 per phase and flag the transfer
+    # whisper turn. Print-only, fully guarded — never touches the call flow.
+    @session.on("metrics_collected")
+    def _on_metrics(ev) -> None:  # noqa: ANN001 (livekit event payload)
+        try:
+            m = ev.metrics
+            fields = {
+                k: round(v, 4)
+                for k in ("end_of_utterance_delay", "transcription_delay",
+                          "ttft", "ttfb", "duration")
+                if isinstance((v := getattr(m, k, None)), (int, float))
+            }
+            if fields:
+                print("[LATENCY] " + json.dumps(
+                    {"kind": type(m).__name__, **fields}, separators=(",", ":")))
+        except Exception:  # noqa: BLE001 — metrics are a nice-to-have, never break the call
             pass
 
     started_mono = time.monotonic()
@@ -739,7 +1401,7 @@ async def entrypoint(ctx: JobContext) -> None:
             ended_at=datetime.now(timezone.utc).isoformat(),
             duration_seconds=int(time.monotonic() - started_mono),
             turns=len(transcript),
-            branch=agent.branch,
+            branch=state.branch,
             voice_id=ELEVEN_VOICE_ID,
             transcript=transcript,
             tts_characters=tts_characters,
@@ -759,7 +1421,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # kicks in from the caller's first reply onward (with client/recall context).
     try:
         await session.say(
-            "Hola, soy Lander, el asistente virtual con inteligencia artificial de "
+            f"Hola, soy {agent_name}, el asistente virtual con inteligencia artificial de "
             "Joblanders. ¿En qué puedo ayudarte?",
             allow_interruptions=True,
         )
