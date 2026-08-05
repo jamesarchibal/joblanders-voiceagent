@@ -30,8 +30,10 @@ PRODUCT: dict[str, str] = {
         "e integramos con todo lo que ya usan."
     ),
     "integracion": (
-        "Trabajamos con la empresa durante el tiempo que haga falta —de unos días a "
-        "dos o cuatro semanas— para integrar sus flujos de forma full y personalizada."
+        "Es a medida: trabajamos con la empresa el tiempo que haga falta —del orden de "
+        "unos días a unas pocas semanas, según su volumen y sus flujos— para integrarlo "
+        "de forma full y personalizada. Al ser a medida no cerramos una fecha exacta de "
+        "entrada; lo concretamos con ellos."
     ),
     "precio": "PENDIENTE_DEFINIR",  # sentinel: never quote a made-up price
 }

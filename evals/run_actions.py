@@ -108,10 +108,27 @@ def directory_block(directory):
     return "\n".join(lines)
 
 
-NOW_CTX = ("CONTEXTO TEMPORAL: hoy es domingo 2 de agosto de 2026.\n"
-           "APERTURA YA DADA: al descolgar ya has dicho por voz 'Hola, soy Lander, el "
-           "asistente virtual con inteligencia artificial de Joblanders. ¿En qué puedo "
-           "ayudarte?'. NO vuelvas a saludar ni a presentarte; responde/enruta directo.")
+def _now_ctx():
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/Madrid"))
+    dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+             "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    rows = [f"- {dias[(now + timedelta(days=i)).weekday()]} "
+            f"{(now + timedelta(days=i)).day} de {meses[(now + timedelta(days=i)).month]} "
+            f"= {(now + timedelta(days=i)):%Y-%m-%d}" for i in range(1, 15)]
+    return (f"CONTEXTO TEMPORAL: hoy es {dias[now.weekday()]} {now.day} de "
+            f"{meses[now.month]} de {now.year} ({now:%Y-%m-%d}).\n"
+            "FECHAS EXACTAS — al agendar usa SIEMPRE la fecha de esta tabla, NUNCA "
+            "calcules el día de la semana tú:\n" + "\n".join(rows) + "\n"
+            "Si dice solo un día ('el martes'), usa el PRIMERO de la tabla (el más próximo).\n"
+            "APERTURA YA DADA: al descolgar ya has dicho por voz 'Hola, soy Lander, el "
+            "asistente virtual con inteligencia artificial de Joblanders. ¿En qué puedo "
+            "ayudarte?'. NO vuelvas a saludar ni a presentarte; responde/enruta directo.")
+
+
+NOW_CTX = _now_ctx()
 BASE = open(os.path.join(AGENT_DIR, "prompts/system_es.md"), encoding="utf-8").read()
 ROLE = {m: open(os.path.join(AGENT_DIR, f"prompts/role_{m}_es.md"), encoding="utf-8").read()
         for m in ("recepcion", "ventas", "soporte")}

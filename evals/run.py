@@ -211,11 +211,24 @@ PROBES = [
     ("ya usamos un ATS", "unknown", ["Ya usamos un ATS y algo de IA. ¿Qué me aportáis vosotros?"], False),
     ("quiere avanzar y contratar joblanders.ai", "unknown", ["Lo tenemos claro, queremos avanzar y contratar joblanders.ai ya. Somos una agencia de 80 recruiters.",
                                                              "Perfecto, pásame con comercial. Soy Laura Gómez."], False),
+    # --- fuera de perfil (no ICP): NO debe pasar_a_ventas ni registrar lead --------
+    ("no es empresa de staffing", "unknown", ["Hola, oye, mira, nosotros no somos una empresa de staffing ni una agencia de recruiting, ¿esto me sirve igual?",
+                                              "Somos una empresa de software, tenemos veinte personas y contratamos nosotros mismos de vez en cuando.",
+                                              "Ya, pero no es lo nuestro contratar mucho. Nada, gracias, adiós."], False),
+    ("candidato buscando trabajo", "unknown", ["Hola, buenas, llamaba porque estoy buscando trabajo y me han dicho que vosotros colocáis gente.",
+                                               "O sea, ¿no me buscáis un empleo? Vale...",
+                                               "Nada, gracias."], False),
+    ("empresa de otro sector", "unknown", ["Hola, no somos una agencia de selección, somos una fábrica. ¿Qué es exactamente lo que vendéis?",
+                                           "Ah, entonces no es para nosotros, ¿no?",
+                                           "Vale, gracias, adiós."], False),
 ]
 
 # Scenarios that are infra-only (e.g. cold-start static-TTS greeting) can't be
 # reproduced by a text-only harness → marked N/A and excluded from the score.
-NONTEXT = ["arranque en frío"]
+# "Primer turno" is the opening AI-disclosure, delivered as a STATIC TTS line on
+# pickup (see "APERTURA YA DADA" in the live agent) — a hardcoded constant, not a
+# brain output, so the text harness can't observe it. Verify it on the greeting string.
+NONTEXT = ["arranque en frío", "primer turno de la llamada"]
 
 def probe_for(scenario):
     for needle, ctype, turns, rec in PROBES:

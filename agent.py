@@ -29,6 +29,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+from livekit import api
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -40,6 +41,7 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    get_job_context,
     metrics,
 )
 from livekit.agents.beta.workflows import WarmTransferTask
@@ -61,6 +63,9 @@ ROLE_PROMPT_PATHS = {
 }
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
 STT_MODEL = os.getenv("STT_MODEL", "nova-3")
+# "multi" = code-switching (nova-3 detecta el idioma por turno y lo devuelve).
+# Pon STT_LANGUAGE="es" para volver a bloquear el STT a español.
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "multi")
 TTS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
 # Cloned "James" voice. Hardcoded fallback so the agent NEVER silently falls back to a
 # default ElevenLabs voice if the secret is missing/empty.
@@ -100,8 +105,8 @@ DEFAULTS = {
     "ELEVENLABS_STABILITY": float(os.getenv("ELEVENLABS_STABILITY", "0.4")),
     "ELEVENLABS_SIMILARITY": float(os.getenv("ELEVENLABS_SIMILARITY", "0.9")),
     "ELEVENLABS_STYLE": float(os.getenv("ELEVENLABS_STYLE", "0.3")),
-    "MIN_INTERRUPTION_DURATION": float(os.getenv("MIN_INTERRUPTION_DURATION", "0.5")),
-    "MIN_INTERRUPTION_WORDS": float(os.getenv("MIN_INTERRUPTION_WORDS", "2")),
+    "MIN_INTERRUPTION_DURATION": float(os.getenv("MIN_INTERRUPTION_DURATION", "0.4")),
+    "MIN_INTERRUPTION_WORDS": float(os.getenv("MIN_INTERRUPTION_WORDS", "1")),
     "FALSE_INTERRUPTION_TIMEOUT": float(os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0")),
     "MIN_ENDPOINTING_DELAY": float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4")),
 }
@@ -612,10 +617,24 @@ class _Bundle:
 
     def instructions_for(self, role: str) -> str:
         now = datetime.now(ZoneInfo("Europe/Madrid"))
+        _DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+        _MESES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                  "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        # Tabla de fechas YA resuelta: Haiku calcula mal el día de la semana, así que
+        # NO le pedimos que compute — le damos día->fecha exacta de los próximos 14 días.
+        rows = []
+        for i in range(1, 15):
+            d = now + timedelta(days=i)
+            rows.append(f"- {_DIAS[d.weekday()]} {d.day} de {_MESES[d.month]} = {d:%Y-%m-%d}")
         date_line = (
-            f"Contexto temporal: hoy es {now:%Y-%m-%d} ({now:%A}), "
-            f"hora local {now:%H:%M} (Europe/Madrid). Úsalo para interpretar "
-            "fechas relativas ('mañana', 'el martes') al agendar."
+            f"Contexto temporal: hoy es {_DIAS[now.weekday()]} {now.day} de "
+            f"{_MESES[now.month]} de {now.year} ({now:%Y-%m-%d}), hora local "
+            f"{now:%H:%M} (Europe/Madrid).\n"
+            "FECHAS EXACTAS de los próximos días — al agendar usa SIEMPRE la fecha de "
+            "esta tabla, NUNCA calcules el día de la semana tú mismo:\n"
+            + "\n".join(rows) + "\n"
+            "Si el llamante dice solo un día ('el martes') sin más, usa el PRIMERO de "
+            "la tabla (el más próximo en el futuro)."
         )
         parts = [self.base_prompt, self.role_prompts.get(role, ""), self.caller_context, date_line]
         if self.recall_block:
@@ -685,6 +704,38 @@ class _BaseLanderAgent(Agent):
                 "insiste en que ya es cliente, ofrécele pasar con una persona."
             ),
         }
+
+    # --- Cierre: despedirse y colgar ----------------------------------------
+    @function_tool
+    async def finalizar_llamada(self, context: RunContext) -> str:
+        """End the call: say a short goodbye and hang up.
+
+        Use this ONLY when the caller has clearly finished — they say "adiós",
+        "nada más", "gracias, eso es todo", "hasta luego" — or when the reason for
+        the call is fully resolved and nothing is pending. Do NOT use it while the
+        caller still has questions or mid-conversation. After you call this, say a
+        single warm farewell sentence and the line hangs up on its own.
+        """
+        job_ctx = get_job_context()
+
+        async def _end() -> None:
+            # Margen para que suene la despedida completa antes de colgar.
+            await asyncio.sleep(4.0)
+            # Borrar la sala cuelga la pata SIP (PSTN) del llamante; aclose desconecta
+            # al agente. Ambos con suppress: colgar nunca debe petar la llamada.
+            with contextlib.suppress(Exception):
+                await job_ctx.api.room.delete_room(
+                    api.DeleteRoomRequest(room=job_ctx.room.name)
+                )
+            with contextlib.suppress(Exception):
+                await context.session.aclose()
+
+        asyncio.create_task(_end())
+        return (
+            "Di UNA sola frase corta y cálida de despedida (p.ej. 'Gracias por llamar "
+            "a Joblanders, ¡que tengas muy buen día!') y NADA más. La llamada se "
+            "colgará sola tras la despedida; no hagas más preguntas."
+        )
 
     # --- Escape hatch: warm transfer to a human -----------------------------
     @function_tool
@@ -1307,7 +1358,7 @@ async def entrypoint(ctx: JobContext) -> None:
     tts = elevenlabs.TTS(**tts_kwargs)
 
     session = AgentSession(
-        stt=deepgram.STT(model=STT_MODEL, language="es"),
+        stt=deepgram.STT(model=STT_MODEL, language=STT_LANGUAGE),
         llm=anthropic.LLM(model=LLM_MODEL),
         tts=tts,
         vad=silero.VAD.load(),
@@ -1329,9 +1380,29 @@ async def entrypoint(ctx: JobContext) -> None:
     # "separate" -> straight into Ventas/Soporte for that number (standalone).
     agent = _ROLE_AGENTS.get(start_role, _ROLE_AGENTS["recepcion"])(bundle)
 
-    # Idioma bloqueado a español: Deepgram STT en language="es" y voz ES fija.
-    # (Se retiró el auto-cambio de voz por idioma: en línea telefónica con ruido
-    # detectaba mal el español y saltaba a otro idioma/voz a mitad de llamada.)
+    # Idioma: STT en modo code-switching (STT_LANGUAGE="multi"). Cuando el llamante
+    # habla en otro idioma, cambiamos la voz clonada de James a la de ese idioma
+    # (VOICE_BY_LANG: en/ca; ES usa la voz por defecto). Guardas anti-falso-cambio en
+    # línea ruidosa (fue el motivo de bloquearlo antes): SOLO turnos FINALES y de
+    # >= MIN_LANG_SWITCH_WORDS palabras, y solo si el idioma cambia de verdad. Si aún
+    # flapea con el ruido, sube MIN_LANG_SWITCH_WORDS o pon STT_LANGUAGE="es".
+    _MIN_LANG_WORDS = int(os.getenv("MIN_LANG_SWITCH_WORDS", "3"))
+
+    @session.on("user_input_transcribed")
+    def _on_user_lang(ev) -> None:  # noqa: ANN001 (livekit event payload)
+        try:
+            if not getattr(ev, "is_final", False):
+                return
+            lang = (getattr(ev, "language", None) or "").split("-")[0].lower()
+            words = len((getattr(ev, "transcript", "") or "").split())
+            if not lang or words < _MIN_LANG_WORDS:
+                return
+            target = VOICE_BY_LANG.get(lang, ELEVEN_VOICE_ID)
+            if target and target != tts.voice_id:
+                tts.update_options(voice_id=target)
+                print(f"[LANG] caller={lang!r} words={words} -> voice={target!r}")
+        except Exception as exc:  # noqa: BLE001 — nunca dejar que el swap rompa la llamada
+            print(f"[LANG] swap error: {exc!r}")
 
     # --- Call log: capture transcript + write one row on shutdown -------------
     transcript: list[dict] = []
