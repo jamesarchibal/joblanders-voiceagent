@@ -187,7 +187,7 @@ PROBES = [
                                         "Soy Laura Gómez, de Acme Logística. Sí, pásame por favor."], False),
     ("soporte", "existing", ["Hola, tengo una incidencia: la plataforma me da error y no puedo entrar.",
                              "Soy Laura Gómez. Sí, pásame con quien lo lleve, gracias."], False),
-    ("contratar", "unknown", ["Hola, somos una empresa de logística de 50 personas y queremos cubrir 15 vacantes. ¿Cómo va y cuánto cuesta?",
+    ("información comercial", "unknown", ["Hola, somos una empresa de logística de 50 personas y queremos cubrir 15 vacantes. ¿Cómo va y cuánto cuesta?",
                               "Suena bien, quiero avanzar ya. ¿Me pasas con comercial? Soy Laura Gómez."], False),
     ("habla en español durante toda", "unknown", ["Buenas, ¿me contáis qué hacéis exactamente?"], False),
     ("ruido de fondo", "unknown", ["Perdona el ruido... eh, sorry, quería saber si tenéis candidatos disponibles ya."], False),
@@ -205,20 +205,20 @@ PROBES = [
     ("on-premise y quién controla los datos", "unknown", ["¿Esto lo instaláis on-premise? ¿Quién controla nuestros datos?"], False),
     ("cuánto tarda la integración", "unknown", ["Vale, ¿y cuánto tarda la integración? ¿Semanas, meses?"], False),
     ("qué agentes tenéis o qué hace la suite", "unknown", ["¿Qué agentes tenéis? ¿Qué hacen exactamente?"], False),
-    ("automatizar el screening", "unknown", ["Somos una agencia de staffing con mucho volumen y queremos automatizar el screening de candidatos. ¿Podéis?",
-                                             "Suena bien, ¿me pasáis con comercial? Soy Laura Gómez."], False),
+    ("automatizar el screening", "unknown", ["Somos una consultora de selección sanitaria en Valencia, movemos muchísimo volumen de enfermería y queremos automatizar el screening. ¿Podéis?",
+                                             "Suena bien, ¿me pasáis con comercial? Soy Marta Sanchís, de TalentMed."], False),
     ("precio de joblanders.ai", "unknown", ["¿Cuánto cuesta? Dame el precio de joblanders punto ai."], False),
     ("ya usamos un ATS", "unknown", ["Ya usamos un ATS y algo de IA. ¿Qué me aportáis vosotros?"], False),
-    ("quiere avanzar y contratar joblanders.ai", "unknown", ["Lo tenemos claro, queremos avanzar y contratar joblanders.ai ya. Somos una agencia de 80 recruiters.",
-                                                             "Perfecto, pásame con comercial. Soy Laura Gómez."], False),
+    ("intención clara", "unknown", ["Lo tenemos claro, queremos avanzar y contratar joblanders.ai ya. Somos una firma de headhunting ejecutivo, unos 40 consultores.",
+                                                             "Perfecto, pásame con comercial. Soy Ignacio Bravo, de Vértice Executive Search."], False),
     # --- fuera de perfil (no ICP): NO debe pasar_a_ventas ni registrar lead --------
-    ("no es empresa de staffing", "unknown", ["Hola, oye, mira, nosotros no somos una empresa de staffing ni una agencia de recruiting, ¿esto me sirve igual?",
-                                              "Somos una empresa de software, tenemos veinte personas y contratamos nosotros mismos de vez en cuando.",
+    ("no es empresa de staffing", "unknown", ["Hola, oye, mira, nosotros somos un despacho de arquitectura, no somos agencia de recruiting ni nada de eso. ¿Esto me sirve igual?",
+                                              "Somos ocho arquitectos y de vez en cuando contratamos un delineante nosotros mismos.",
                                               "Ya, pero no es lo nuestro contratar mucho. Nada, gracias, adiós."], False),
     ("candidato buscando trabajo", "unknown", ["Hola, buenas, llamaba porque estoy buscando trabajo y me han dicho que vosotros colocáis gente.",
                                                "O sea, ¿no me buscáis un empleo? Vale...",
                                                "Nada, gracias."], False),
-    ("empresa de otro sector", "unknown", ["Hola, no somos una agencia de selección, somos una fábrica. ¿Qué es exactamente lo que vendéis?",
+    ("empresa de otro sector", "unknown", ["Hola, no somos una agencia de selección, tenemos una cadena de restaurantes. ¿Qué es exactamente lo que vendéis?",
                                            "Ah, entonces no es para nosotros, ¿no?",
                                            "Vale, gracias, adiós."], False),
 ]
@@ -305,10 +305,17 @@ def simulate_and_judge(c):
         verdict = json.loads(jtext[jtext.index("{"):jtext.rindex("}") + 1])
     except Exception:
         verdict = {"verdict": "?", "reason": jtext[:120]}
-    return verdict.get("verdict"), verdict.get("reason"), tool_calls
+    return verdict.get("verdict"), verdict.get("reason"), tool_calls, convo
 
 
 ATTEMPTS = 3  # the brain runs at prod temperature, so retry FAILs to beat flakiness
+LIMIT = int(os.getenv("EVAL_LIMIT", "0"))  # 0 = all; else run only N cases
+OFFSET = int(os.getenv("EVAL_OFFSET", "0"))  # skip the first OFFSET cases
+SHOW_TX = os.getenv("SHOW_TRANSCRIPTS", "") not in ("", "0", "false")  # dump full transcripts
+if OFFSET:
+    evals = evals[OFFSET:]
+if LIMIT:
+    evals = evals[:LIMIT]
 results = []
 for c in evals:
     scenario = c.get("scenario", "")
@@ -318,18 +325,18 @@ for c in evals:
         results.append({"cat": c.get("category"), "scenario": scenario[:52],
                         "saved": c.get("status"), "verdict": "N/A",
                         "reason": "Infra (saludo en frío = TTS estático); no testable por texto.",
-                        "tools": []})
+                        "tools": [], "tx": ""})
         continue
     # Up to ATTEMPTS tries, stop on first PASS. A genuinely broken case fails them all;
     # a rare flake passes on retry. Only FAILs pay the extra cost.
     for attempt in range(1, ATTEMPTS + 1):
-        v, reason, tool_calls = simulate_and_judge(c)
+        v, reason, tool_calls, convo = simulate_and_judge(c)
         if v == "PASS":
             if attempt > 1:
                 reason = f"(intento {attempt}/{ATTEMPTS}) {reason}"
             break
     results.append({"cat": c.get("category"), "scenario": scenario[:52], "saved": c.get("status"),
-                    "verdict": v, "reason": reason, "tools": tool_calls})
+                    "verdict": v, "reason": reason, "tools": tool_calls, "tx": convo})
 
 print(f"{'CAT':<22}{'SAVED':<11}{'RUN':<7}SCENARIO")
 print("-" * 96)
@@ -344,6 +351,11 @@ for r in results:
             npass += 1
     print(f"{(r['cat'] or '')[:21]:<22}{(r['saved'] or ''):<11}{(r['verdict'] or '?'):<7}{r['scenario']}")
     print(f"{'':<40}↳ {r['reason']}  tools={r['tools']}")
+    if SHOW_TX and r.get("tx"):
+        print("    ┌─ TRANSCRIPCIÓN " + "─" * 40)
+        for ln in r["tx"].split("\n"):
+            print("    │ " + ln)
+        print("    └" + "─" * 56)
 print("-" * 96)
 na = len(results) - scored
 print(f"RESULT: {npass}/{scored} PASS" + (f" ({na} N/A infra)" if na else ""))
