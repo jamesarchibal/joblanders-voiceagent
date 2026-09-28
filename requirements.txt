@@ -1,7 +1,16 @@
 # Joblanders Voice Agent — Milestone 0/1 (cascaded pipeline)
 # Python 3.11+ recommended.
 
-livekit-agents[anthropic,cartesia,deepgram,elevenlabs,silero,turn-detector]~=1.6
+# PIN EXACTO. `~=1.6` dejaba subir a 1.8.x, y la 1.8 deja obsoletos
+# min_interruption_duration / min_interruption_words / resume_false_interruption
+# y activa un "adaptive interruption detector" que cortaba a Lander a media frase.
+# 1.6.5 es la version que corre en local y la que esta probada. No subir sin probar.
+livekit-agents[anthropic,cartesia,deepgram,elevenlabs,silero,turn-detector]==1.6.5
+# PIN OBLIGATORIO junto al de arriba. El plugin anthropic de livekit 1.6.x le pasa un
+# `httpx.AsyncClient` al SDK. El SDK nuevo migro a `httpx2` y RECHAZA objetos httpx con
+# "TypeError: Invalid http_client argument", asi que el agente crasheaba en CADA llamada
+# y el telefono no lo cogia. 0.116.0 es la que corre en local y esta probada.
+anthropic~=0.116.0
 python-dotenv~=1.0
 # Google Calendar auto-booking (SDR demos): service account + domain-wide delegation.
 google-auth~=2.56

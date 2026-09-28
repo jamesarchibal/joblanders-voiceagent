@@ -36,6 +36,7 @@ from livekit.agents import (
     AudioConfig,
     BackgroundAudioPlayer,
     BuiltinAudioClip,
+    ChatContext,
     JobContext,
     RunContext,
     WorkerOptions,
@@ -60,12 +61,27 @@ ROLE_PROMPT_PATHS = {
     "recepcion": Path(__file__).parent / "prompts" / "role_recepcion_es.md",
     "ventas": Path(__file__).parent / "prompts" / "role_ventas_es.md",
     "soporte": Path(__file__).parent / "prompts" / "role_soporte_es.md",
+    # Cribado (prescreening de candidatos) es un modo DEMO: solo se ofrece a los
+    # números de CRIBADO_DEMO_NUMBERS. Ver _is_cribado_demo.
+    "cribado": Path(__file__).parent / "prompts" / "role_cribado_es.md",
 }
+# Números (caller-ID) autorizados a usar el modo Cribado, separados por comas. Vacío
+# = nadie, que es el estado normal en producción: un llamante real NUNCA ve el modo.
+CRIBADO_DEMO_NUMBERS = os.getenv("CRIBADO_DEMO_NUMBERS", "")
+# Con CRIBADO_DIRECT=1 esos números arrancan YA en Cribado, saltándose Recepción y el
+# handoff. Un turno menos de LLM, que es el que se notaba como espera en la demo.
+CRIBADO_DIRECT = os.getenv("CRIBADO_DIRECT", "").strip().lower() in ("1", "true", "yes")
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
 STT_MODEL = os.getenv("STT_MODEL", "nova-3")
 # "multi" = code-switching (nova-3 detecta el idioma por turno y lo devuelve).
 # Pon STT_LANGUAGE="es" para volver a bloquear el STT a español.
 STT_LANGUAGE = os.getenv("STT_LANGUAGE", "multi")
+# Saludo estático de apertura (sin LLM). `{name}` se sustituye por el nombre del agente.
+# Cámbialo con GREETING_TEXT para abrir en otro idioma (p. ej. una demo en catalán).
+GREETING_TEXT = os.getenv("GREETING_TEXT") or (
+    "Hola, soy {name}, el asistente virtual con inteligencia artificial de "
+    "Joblanders. ¿En qué puedo ayudarte?"
+)
 TTS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
 # Cloned "James" voice. Hardcoded fallback so the agent NEVER silently falls back to a
 # default ElevenLabs voice if the secret is missing/empty.
@@ -105,8 +121,12 @@ DEFAULTS = {
     "ELEVENLABS_STABILITY": float(os.getenv("ELEVENLABS_STABILITY", "0.4")),
     "ELEVENLABS_SIMILARITY": float(os.getenv("ELEVENLABS_SIMILARITY", "0.9")),
     "ELEVENLABS_STYLE": float(os.getenv("ELEVENLABS_STYLE", "0.3")),
-    "MIN_INTERRUPTION_DURATION": float(os.getenv("MIN_INTERRUPTION_DURATION", "0.4")),
-    "MIN_INTERRUPTION_WORDS": float(os.getenv("MIN_INTERRUPTION_WORDS", "1")),
+    # Anti-corte. Con 0.4s / 1 palabra, por telefono el eco de la propia linea, una tos
+    # o un "mhm" daban a Lander por interrumpido y se callaba a media frase. Exigimos
+    # habla real y sostenida: ~1s y 3 palabras. Se sigue pudiendo interrumpir con una
+    # frase de verdad, que es lo unico que deberia callarlo.
+    "MIN_INTERRUPTION_DURATION": float(os.getenv("MIN_INTERRUPTION_DURATION", "1.0")),
+    "MIN_INTERRUPTION_WORDS": float(os.getenv("MIN_INTERRUPTION_WORDS", "3")),
     "FALSE_INTERRUPTION_TIMEOUT": float(os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0")),
     "MIN_ENDPOINTING_DELAY": float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4")),
 }
@@ -147,6 +167,19 @@ def _last9(phone: str) -> str:
     """Last 9 digits of a phone (ignores +/00/country prefix + separators)."""
     digits = "".join(ch for ch in (phone or "") if ch.isdigit())
     return digits[-9:] if len(digits) >= 9 else digits
+
+
+def _is_cribado_demo(caller: str | None) -> bool:
+    """True si este caller-ID puede usar el modo Cribado (demo comercial).
+
+    Gated a propósito: el cribado de candidatos contradice la regla general del
+    prompt base ("Joblanders no coloca gente"), así que solo se activa para los
+    números listados en CRIBADO_DEMO_NUMBERS. Sin esa variable, nadie lo ve.
+    """
+    key = _last9(caller or "")
+    if not key:
+        return False
+    return any(_last9(n) == key for n in CRIBADO_DEMO_NUMBERS.split(",") if n.strip())
 
 
 def _match_client(caller: str | None, clients: list[dict]) -> dict | None:
@@ -582,6 +615,8 @@ class _CallState:
 
     branch: str | None = None
     transferring: bool = False
+    # Ficha del cribado de candidato, si la llamada pasó por el modo Cribado.
+    cribado: dict | None = None
     # True cuando la llamada arranca directamente en Ventas/Soporte por su propio
     # número (routing_mode="separate"): sin Recepción, sin triaje y sin cambio de
     # modo. Los agentes usan este flag para no re-saludar ni cruzar de modo.
@@ -614,6 +649,8 @@ class _Bundle:
     agent_name: str = "Lander"
     # Caller-ID entrante (para registrar el teléfono al loguear un lead en el CRM).
     caller: str | None = None
+    # True solo para los números de CRIBADO_DEMO_NUMBERS: habilita el modo Cribado.
+    cribado_demo: bool = False
 
     def instructions_for(self, role: str) -> str:
         now = datetime.now(ZoneInfo("Europe/Madrid"))
@@ -637,6 +674,19 @@ class _Bundle:
             "la tabla (el más próximo en el futuro)."
         )
         parts = [self.base_prompt, self.role_prompts.get(role, ""), self.caller_context, date_line]
+        # Demo de cribado: el prompt base manda despachar a los candidatos ("no
+        # colocamos gente"). Para los números autorizados lo levantamos, solo en
+        # Recepción, que es donde se decide el enrutado.
+        if self.cribado_demo and role == "recepcion":
+            parts.append(
+                "# Cribado de candidatos (ACTIVO en esta llamada)\n"
+                "Excepción a la regla de 'si busca trabajo, remítele a portales de "
+                "empleo': en esta llamada SÍ puedes cribar candidatos. Si la persona "
+                "llama por un puesto, una oferta o una entrevista, llama a "
+                "`pasar_a_cribado` en ese mismo turno (con una pregunta corta de "
+                "calificación, como en cualquier otro handoff). El resto de motivos "
+                "siguen yendo a Ventas o Soporte como siempre."
+            )
         if self.recall_block:
             parts.append(self.recall_block)
         if self.directory_block:
@@ -1140,6 +1190,74 @@ class SoporteAgent(_BaseLanderAgent):
         return VentasAgent(self._bundle, chat_ctx=self.chat_ctx)
 
 
+class CribadoAgent(_BaseLanderAgent):
+    """Modo CRIBADO (demo): prescreening telefónico de un candidato a un puesto.
+
+    Solo se alcanza desde `pasar_a_cribado`, que a su vez solo existe para los
+    números de CRIBADO_DEMO_NUMBERS. Hereda el traspaso a humano y el colgado.
+    """
+
+    role = "cribado"
+
+    @function_tool
+    async def registrar_cribado(
+        self,
+        context: RunContext,
+        puesto: str,
+        nombre: str = "",
+        experiencia: str = "",
+        disponibilidad: str = "",
+        salario: str = "",
+        ubicacion: str = "",
+        idiomas: str = "",
+        encaje: str = "",
+        motivo: str = "",
+    ) -> dict:
+        """Registra el cribado del candidato para que lo revise el reclutador humano.
+
+        Llámala UNA sola vez, cuando ya hayas recogido los puntos del cribado (o el
+        candidato no pueda darte más). No le anuncies al candidato que lo registras
+        ni le digas su nivel de encaje: eso es interno, para el reclutador.
+
+        Args:
+            puesto: Puesto u oferta a la que opta. Obligatorio.
+            nombre: Nombre del candidato. Déjalo vacío si no te lo ha dado; nunca lo inventes.
+            experiencia: Años y en qué, tal y como te lo ha contado.
+            disponibilidad: Cuándo podría incorporarse y jornada que busca.
+            salario: Lo que pide, con la unidad (bruto anual, por hora…).
+            ubicacion: Dónde vive y su movilidad (presencial, híbrido, remoto).
+            idiomas: Idiomas y nivel real de cada uno.
+            encaje: Tu valoración: "alto", "medio" o "bajo".
+            motivo: UNA frase justificando el encaje, para el reclutador.
+        """
+        puesto = (puesto or "").strip()
+        if not puesto:
+            return {
+                "registrado": False,
+                "say": "Pregúntale primero a qué puesto opta antes de registrar el cribado.",
+            }
+        encaje_norm = (encaje or "").strip().lower()
+        if encaje_norm not in ("alto", "medio", "bajo"):
+            encaje_norm = "medio"
+        ficha = {
+            "puesto": puesto,
+            "nombre": (nombre or "").strip(),
+            "experiencia": (experiencia or "").strip(),
+            "disponibilidad": (disponibilidad or "").strip(),
+            "salario": (salario or "").strip(),
+            "ubicacion": (ubicacion or "").strip(),
+            "idiomas": (idiomas or "").strip(),
+            "encaje": encaje_norm,
+            "motivo": (motivo or "").strip(),
+            "telefono": getattr(self._bundle, "caller", None) or "",
+        }
+        # La ficha viaja en el log de la llamada (save_call_log al colgar). No hay
+        # tabla de candidatos todavía, así que no inventamos un insert en el CRM.
+        self._state.cribado = ficha
+        print(f"[CRIBADO] {ficha}")
+        return {"registrado": True, "ficha": ficha}
+
+
 class RecepcionistaAgent(_BaseLanderAgent):
     """Modo RECEPCIÓN (maestro): saluda, triajea el motivo en 1-2 preguntas y
     cambia de modo de forma INVISIBLE a Ventas o Soporte. No responde el caso él
@@ -1175,6 +1293,25 @@ class RecepcionistaAgent(_BaseLanderAgent):
         return SoporteAgent(self._bundle, chat_ctx=self.chat_ctx)
 
 
+class RecepcionistaCribadoAgent(RecepcionistaAgent):
+    """Recepción + la salida a Cribado. Solo se instancia para los caller-ID de
+    CRIBADO_DEMO_NUMBERS, así que un llamante real nunca tiene esta tool.
+    """
+
+    @function_tool
+    async def pasar_a_cribado(self, context: RunContext) -> Agent:
+        """Cambia INTERNAMENTE al modo Cribado, invisible para el llamante.
+
+        Úsala cuando la persona llama por un PUESTO al que opta: una oferta, una
+        candidatura, una entrevista, o dice que viene de una agencia por un trabajo.
+        NO digas que le pasas con nadie ni te vuelvas a presentar: para el llamante
+        sigues siendo la misma persona. Se lleva toda la memoria de lo hablado.
+        """
+        self._state.branch = "cribado"
+        print("[HANDOFF] recepcion -> cribado")
+        return CribadoAgent(self._bundle, chat_ctx=self.chat_ctx)
+
+
 def _load_role_prompts(cfg) -> dict:
     """Bloque de rol por modo: override del dashboard si existe, si no el fichero local."""
     overrides = {
@@ -1194,8 +1331,16 @@ def _load_role_prompts(cfg) -> dict:
     return out
 
 
+def _recepcion_agent(b) -> Agent:  # noqa: ANN001 (_Bundle)
+    if not b.cribado_demo:
+        return RecepcionistaAgent(b)
+    if CRIBADO_DIRECT:
+        return CribadoAgent(b)  # sin triaje ni handoff: entra directo a precualificar
+    return RecepcionistaCribadoAgent(b)
+
+
 _ROLE_AGENTS = {
-    "recepcion": lambda b: RecepcionistaAgent(b),
+    "recepcion": _recepcion_agent,
     "ventas": lambda b: VentasAgent(b),
     "soporte": lambda b: SoporteAgent(b),
 }
@@ -1317,12 +1462,16 @@ async def entrypoint(ctx: JobContext) -> None:
     start_role = _starting_role(cfg, dialed)
     standalone = cfg.routing_mode == "separate" and start_role != "recepcion"
     agent_name = (cfg.agents.get(start_role) or {}).get("name") or "Lander"
+    cribado_demo = _is_cribado_demo(caller)
+    cribado_direct = cribado_demo and CRIBADO_DIRECT and start_role == "recepcion"
     print(
         f"[ROUTING] mode={cfg.routing_mode} dialed={dialed!r} -> start_role={start_role} "
-        f"standalone={standalone} name={agent_name!r}"
+        f"standalone={standalone} name={agent_name!r} cribado_demo={cribado_demo} "
+        f"cribado_direct={cribado_direct}"
     )
 
-    state = _CallState(standalone=standalone, branch=start_role if standalone else None)
+    branch = "cribado" if cribado_direct else (start_role if standalone else None)
+    state = _CallState(standalone=standalone, branch=branch)
     bundle = _Bundle(
         base_prompt=base_prompt,
         role_prompts=role_prompts,
@@ -1337,6 +1486,7 @@ async def entrypoint(ctx: JobContext) -> None:
         routing_mode=cfg.routing_mode,
         agent_name=agent_name,
         caller=caller,
+        cribado_demo=cribado_demo,
     )
     voice_settings = elevenlabs.VoiceSettings(
         stability=p("ELEVENLABS_STABILITY"),
@@ -1357,9 +1507,14 @@ async def entrypoint(ctx: JobContext) -> None:
         tts_kwargs["language"] = TTS_LANGUAGE
     tts = elevenlabs.TTS(**tts_kwargs)
 
+    # caching="ephemeral": el prompt del sistema son ~14 KB y se reenvia ENTERO en cada
+    # turno. Sin cache, Haiku tardaba 2,5-2,8 s en el primer token. Con cache, a partir
+    # del segundo turno Anthropic reutiliza el prefijo y el TTFT baja mucho.
+    brain = anthropic.LLM(model=LLM_MODEL, caching="ephemeral")
+
     session = AgentSession(
         stt=deepgram.STT(model=STT_MODEL, language=STT_LANGUAGE),
-        llm=anthropic.LLM(model=LLM_MODEL),
+        llm=brain,
         tts=tts,
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
@@ -1398,7 +1553,8 @@ async def entrypoint(ctx: JobContext) -> None:
             if not lang or words < _MIN_LANG_WORDS:
                 return
             target = VOICE_BY_LANG.get(lang, ELEVEN_VOICE_ID)
-            if target and target != tts.voice_id:
+            # El plugin guarda la voz en _opts, no como atributo público.
+            if target and target != tts._opts.voice_id:
                 tts.update_options(voice_id=target)
                 print(f"[LANG] caller={lang!r} words={words} -> voice={target!r}")
         except Exception as exc:  # noqa: BLE001 — nunca dejar que el swap rompa la llamada
@@ -1484,6 +1640,23 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_write_call_log)
 
+    # Calentar la conexión con Anthropic. En frío, la PRIMERA completion tardaba ~18 s
+    # (timeout + reintento) y el llamante oía silencio justo tras hablar por primera vez.
+    # Esta petición mínima abre TLS y el pool HTTP mientras suena el saludo estático.
+    async def _warm_llm() -> None:
+        try:
+            warm_ctx = ChatContext()
+            warm_ctx.add_message(role="user", content="hola")
+            t0 = time.monotonic()
+            async with brain.chat(chat_ctx=warm_ctx) as stream:
+                async for _ in stream:
+                    break
+            print(f"[WARM] llm ready in {time.monotonic() - t0:.2f}s")
+        except Exception as exc:  # noqa: BLE001 — calentar nunca puede romper la llamada
+            print(f"[WARM] llm warmup failed: {exc!r}")
+
+    warm_task = asyncio.create_task(_warm_llm())
+
     await session.start(agent=agent, room=ctx.room)
 
     # Mandatory opening turn: STATIC greeting via TTS (no LLM) so the caller ALWAYS
@@ -1492,8 +1665,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # kicks in from the caller's first reply onward (with client/recall context).
     try:
         await session.say(
-            f"Hola, soy {agent_name}, el asistente virtual con inteligencia artificial de "
-            "Joblanders. ¿En qué puedo ayudarte?",
+            GREETING_TEXT.format(name=agent_name),
             allow_interruptions=True,
         )
     except Exception as exc:  # noqa: BLE001 — never let the greeting break the call
