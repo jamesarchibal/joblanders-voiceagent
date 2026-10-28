@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -49,6 +50,7 @@ from livekit.agents.beta.workflows import WarmTransferTask
 from livekit.plugins import anthropic, deepgram, elevenlabs, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+import eleven_v4
 from calllog import fetch_prior_calls, save_call_log
 from config import load_config
 
@@ -68,9 +70,27 @@ ROLE_PROMPT_PATHS = {
 # Números (caller-ID) autorizados a usar el modo Cribado, separados por comas. Vacío
 # = nadie, que es el estado normal en producción: un llamante real NUNCA ve el modo.
 CRIBADO_DEMO_NUMBERS = os.getenv("CRIBADO_DEMO_NUMBERS", "")
+# Abre el modo Cribado a CUALQUIERA que llame por teléfono, sin mirar el caller-ID.
+# Nació para la demo de Marlex (29-sep): el número público estaba en manos del cliente,
+# que marcaba desde números que no conocíamos de antemano.
+# El default es "0", o sea CERRADO, que es el estado normal en producción. Durante la
+# demo estuvo en "1" en el código. Para volver a abrirlo basta con poner el secreto
+# CRIBADO_OPEN_TO_ALL=1; no hace falta tocar este fichero.
+# OJO: si el secreto está puesto en el despliegue, manda él y este default da igual.
+CRIBADO_OPEN_TO_ALL = os.getenv("CRIBADO_OPEN_TO_ALL", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 # Con CRIBADO_DIRECT=1 esos números arrancan YA en Cribado, saltándose Recepción y el
 # handoff. Un turno menos de LLM, que es el que se notaba como espera en la demo.
-CRIBADO_DIRECT = os.getenv("CRIBADO_DIRECT", "").strip().lower() in ("1", "true", "yes")
+# Si el cribado está abierto a todos estamos en demo, así que se fuerza: si entraran por
+# Recepción oirían el saludo genérico de Joblanders, que es justo lo que pasó con Marlex.
+CRIBADO_DIRECT = CRIBADO_OPEN_TO_ALL or os.getenv("CRIBADO_DIRECT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
 STT_MODEL = os.getenv("STT_MODEL", "nova-3")
 # "multi" = code-switching (nova-3 detecta el idioma por turno y lo devuelve).
@@ -82,7 +102,35 @@ GREETING_TEXT = os.getenv("GREETING_TEXT") or (
     "Hola, soy {name}, el asistente virtual con inteligencia artificial de "
     "Joblanders. ¿En qué puedo ayudarte?"
 )
-TTS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+# Saludo propio de Cribado: quien llama es un candidato, no un cliente. Va en código y no
+# en un secreto a propósito, porque `lk agent update-secrets` REEMPLAZA en bloque.
+# Tres decisiones medidas el 29-sep, no estéticas:
+#  - "Sóc una IA." en frase APARTE. Pegado a "amb" ElevenLabs lo decía "ANBIA"; solo
+#    ("Sóc una IA") sale limpio. Cumple igual el aviso del EU AI Act art. 50.
+#  - "Joblanders", no "JobLanders": la L mayúscula en medio hacía que lo leyera
+#    "Job Landers", dos palabras.
+#  - Nunca "et truco": el número es ENTRANTE, ha marcado el candidato.
+#  - Nombra la POSICIÓN. En la llamada del 29-sep el saludo no la decía, Lander preguntó
+#    "quants anys d'experiència tens en aquesta feina?" y el candidato contestó "Quina
+#    feina?". Diciéndola de entrada se ahorra ese turno perdido.
+#  - "recursos humans" escrito entero, nunca "RRHH": las siglas las destroza el TTS,
+#    igual que pasaba con "IA" pegada a "amb".
+GREETING_TEXT_CRIBADO = os.getenv("GREETING_TEXT_CRIBADO") or (
+    "Hola, sóc en {name}, l'assistent virtual de Joblanders. Sóc una IA. "
+    "Faré una primera qualificació per a la posició de consultor de recursos humans "
+    "per a Marlex. Et va bé si comencem?"
+)
+# Eleven v4 Turbo desde el 29-sep-2026. Se eligió de oído, comparando las 5 frases más
+# largas de llamadas REALES contra `eleven_turbo_v2_5` (ver `/tmp/v4test.py`).
+# No habla por el websocket normal: `eleven_v4.py` lo traduce al de text-to-dialogue.
+# Se pone aquí y no en un secreto a propósito: `ELEVENLABS_MODEL` NO está entre los 12
+# secretos desplegados, así que manda este valor, y así no hay que tocar
+# `lk agent update-secrets`, que REEMPLAZA en bloque y ya nos borró los secretos una vez.
+# Para volver atrás: dejar `eleven_turbo_v2_5` aquí y desplegar. El parche solo se aplica
+# si el nombre empieza por `eleven_v4`.
+# Contrapartida conocida y aceptada: v4 habla ~17% más despacio (10,92s contra 9,30s
+# la misma frase), aunque arranca antes (ttfb 0,64s contra 0,76s por el plugin).
+TTS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v4_turbo")
 # Cloned "James" voice. Hardcoded fallback so the agent NEVER silently falls back to a
 # default ElevenLabs voice if the secret is missing/empty.
 ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID") or "wEQE8Agx2GxUkKIOCNny"
@@ -114,13 +162,16 @@ def _netelip_national(phone: str) -> str:
 
 # Config can still hold the "+" form; we normalise here.
 TRANSFER_NUMBER = _netelip_national(os.getenv("TRANSFER_NUMBER") or "+34623004169")
-# Tuned to sound human, not robotic (turbo model + these settings, chosen by A/B on real samples):
-# lower stability = more natural intonation; high similarity = closer to the cloned voice; some style.
-# These are DEFAULTS; the dashboard (Parámetros tab) can override each at call start.
+# Ajustes de voz. Antes eran stability=0.4 / style=0.3, buscando entonación viva. En
+# catalán, sobre una voz clonada, eso derivaba de tono y de acento entre frases. Medido
+# el 29-sep: con 0.4/0.3, Deepgram fundía tres frases en una porque las pausas se
+# perdían; con stability 0.7-0.85 y style 0 la puntuación salía correcta. style>0 además
+# cuesta latencia, así que ponerlo a 0 estabiliza Y acelera.
+# Estos son DEFAULTS; el dashboard (pestaña Parámetros) puede sobreescribirlos al iniciar.
 DEFAULTS = {
-    "ELEVENLABS_STABILITY": float(os.getenv("ELEVENLABS_STABILITY", "0.4")),
+    "ELEVENLABS_STABILITY": float(os.getenv("ELEVENLABS_STABILITY", "0.75")),
     "ELEVENLABS_SIMILARITY": float(os.getenv("ELEVENLABS_SIMILARITY", "0.9")),
-    "ELEVENLABS_STYLE": float(os.getenv("ELEVENLABS_STYLE", "0.3")),
+    "ELEVENLABS_STYLE": float(os.getenv("ELEVENLABS_STYLE", "0.0")),
     # Anti-corte. Con 0.4s / 1 palabra, por telefono el eco de la propia linea, una tos
     # o un "mhm" daban a Lander por interrumpido y se callaba a media frase. Exigimos
     # habla real y sostenida: ~1s y 3 palabras. Se sigue pudiendo interrumpir con una
@@ -169,13 +220,32 @@ def _last9(phone: str) -> str:
     return digits[-9:] if len(digits) >= 9 else digits
 
 
-def _is_cribado_demo(caller: str | None) -> bool:
+def _is_phone_call(room_name: str | None) -> bool:
+    """True si la sala viene del trunk SIP, o sea si han marcado el número público.
+
+    La dispatch rule (SDR_y2wBGdCfAp3V, Individual/Caller) nombra esas salas
+    `call_<caller>_<random>`. El botón "Habla con Lander" de joblanders.ai crea salas
+    con otro nombre, así que este prefijo separa teléfono de web sin ambigüedad.
+    Sirve para que la demo abierta de Cribado NO se cuele en la web pública.
+    """
+    return bool(room_name) and room_name.startswith("call_")
+
+
+def _is_cribado_demo(caller: str | None, room_name: str | None = None) -> bool:
     """True si este caller-ID puede usar el modo Cribado (demo comercial).
 
     Gated a propósito: el cribado de candidatos contradice la regla general del
     prompt base ("Joblanders no coloca gente"), así que solo se activa para los
     números listados en CRIBADO_DEMO_NUMBERS. Sin esa variable, nadie lo ve.
+
+    Excepción: con CRIBADO_OPEN_TO_ALL=1 (demo Marlex) entra cualquiera que llame POR
+    TELÉFONO, incluso sin caller-ID, porque el cliente marca desde números que no
+    conocemos de antemano. Se limita al teléfono a propósito: el worker atiende todas
+    las salas, así que sin este filtro el botón "Habla con Lander" de joblanders.ai
+    también daría el cribado de Marlex a cualquier visitante de la web.
     """
+    if CRIBADO_OPEN_TO_ALL and _is_phone_call(room_name):
+        return True
     key = _last9(caller or "")
     if not key:
         return False
@@ -694,6 +764,32 @@ class _Bundle:
         return "\n\n".join(p for p in parts if p and p.strip())
 
 
+# Caracteres que delatan UTF-8 leído como MacRoman. Visto en producción el 29-sep: en el
+# cierre del cribado Haiku emitió "revisar√†" y "m√©s" en vez de "revisarà" y "més", y
+# ElevenLabs los leyó en voz alta. `à` son los bytes C3 A0, y en MacRoman C3='√' y A0='†'.
+# No está en los prompts (los 7 son UTF-8 válido): lo generó el modelo, y solo en la
+# generación más larga de la llamada. No podemos impedir que lo genere, así que lo
+# reparamos justo antes de sintetizar.
+_MOJIBAKE_MARKS = "√†©Â®¬Ãã¢"
+# Solo tocamos RACHAS de 2+ caracteres no-ASCII seguidos. Una vocal acentuada suelta
+# ("experiència") nunca entra, que es lo que la mantiene a salvo.
+_MOJIBAKE_RUN = re.compile(r"[\u0080-\uffff]{2,}")
+
+
+def _repair_mojibake(text: str) -> str:
+    """Reconstruye rachas de mojibake MacRoman; deja el resto intacto."""
+    def _fix(m: re.Match[str]) -> str:
+        run = m.group(0)
+        if not any(c in _MOJIBAKE_MARKS for c in run):
+            return run
+        try:
+            return run.encode("mac_roman").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            # Irreparable: mejor comerse los caracteres que leerlos en voz alta.
+            return "".join(c for c in run if c not in _MOJIBAKE_MARKS)
+    return _MOJIBAKE_RUN.sub(_fix, text)
+
+
 class _BaseLanderAgent(Agent):
     """Base común de los tres modos de Lander.
 
@@ -722,6 +818,29 @@ class _BaseLanderAgent(Agent):
         self._clients = bundle.clients or []
         # Estado mutable compartido (rama detectada + guard de traspaso).
         self._state = bundle.state
+
+    # --- Limpieza del texto antes de sintetizarlo ---------------------------
+    def tts_node(self, text, model_settings):  # noqa: ANN001, ANN201 (firma del framework)
+        """Repara mojibake y aplana saltos de línea antes de que hable ElevenLabs.
+
+        Único punto por el que pasa TODO lo que Lander dice, en los cuatro modos.
+        Trabaja sobre el stream, así que no añade latencia: solo retiene el último
+        carácter de cada trozo cuando es sospechoso, por si la racha de mojibake
+        viene partida entre dos trozos del stream.
+        """
+        async def _clean():
+            carry = ""
+            async for chunk in text:
+                buf = carry + chunk
+                carry = ""
+                if buf and buf[-1] in _MOJIBAKE_MARKS:
+                    buf, carry = buf[:-1], buf[-1]
+                if buf:
+                    yield _repair_mojibake(buf).replace("\n", " ")
+            if carry:
+                yield _repair_mojibake(carry).replace("\n", " ")
+
+        return Agent.default.tts_node(self, _clean(), model_settings)
 
     # --- Fallback: identificar a un cliente por email -----------------------
     @function_tool
@@ -1462,7 +1581,7 @@ async def entrypoint(ctx: JobContext) -> None:
     start_role = _starting_role(cfg, dialed)
     standalone = cfg.routing_mode == "separate" and start_role != "recepcion"
     agent_name = (cfg.agents.get(start_role) or {}).get("name") or "Lander"
-    cribado_demo = _is_cribado_demo(caller)
+    cribado_demo = _is_cribado_demo(caller, call_room_name)
     cribado_direct = cribado_demo and CRIBADO_DIRECT and start_role == "recepcion"
     print(
         f"[ROUTING] mode={cfg.routing_mode} dialed={dialed!r} -> start_role={start_role} "
@@ -1499,6 +1618,12 @@ async def entrypoint(ctx: JobContext) -> None:
         f"[VOICE] voice_id={ELEVEN_VOICE_ID!r} model={TTS_MODEL!r} api_key_set={bool(ELEVEN_API_KEY)} "
         f"prompt={'dashboard' if cfg.prompt else 'local'} knowledge={len(cfg.knowledge)}"
     )
+    # Eleven v4 no habla por el websocket normal de text-to-speech; hay que traducirlo
+    # al socket de text-to-dialogue. Ver `eleven_v4.py`. Solo se activa si el modelo
+    # empieza por `eleven_v4`, así que con cualquier otro valor esta línea no hace nada.
+    if eleven_v4.is_v4(TTS_MODEL):
+        eleven_v4.enable()
+
     # Build the ElevenLabs TTS. `language` is only passed when forced (else auto-detect).
     tts_kwargs: dict = dict(model=TTS_MODEL, api_key=ELEVEN_API_KEY, voice_settings=voice_settings)
     if ELEVEN_VOICE_ID:
@@ -1645,17 +1770,51 @@ async def entrypoint(ctx: JobContext) -> None:
     # Esta petición mínima abre TLS y el pool HTTP mientras suena el saludo estático.
     async def _warm_llm() -> None:
         try:
+            # DIAGNOSTICO (28-sep): el ttft de los turnos reales es 2,3s, pero este
+            # warm-up daba 0,72s desde el MISMO contenedor y con el MISMO modelo. Eso
+            # descarta red y modelo. Quedaban dos causas mezcladas: el tamaño del prompt
+            # (aquí iba un "hola" pelado) y la contención de CPU (aquí la CPU está libre).
+            # Mandando ahora el prompt REAL con la CPU libre, las separamos:
+            #   [WARM] ~0,7s  -> el prompt no cuesta nada, los 2,3s son CPU.
+            #   [WARM] ~2,3s  -> es el prompt en este entorno, no la CPU.
             warm_ctx = ChatContext()
+            warm_ctx.add_message(role="system", content=bundle.instructions_for(start_role))
             warm_ctx.add_message(role="user", content="hola")
             t0 = time.monotonic()
             async with brain.chat(chat_ctx=warm_ctx) as stream:
                 async for _ in stream:
                     break
-            print(f"[WARM] llm ready in {time.monotonic() - t0:.2f}s")
+            print(f"[WARM] llm ready in {time.monotonic() - t0:.2f}s "
+                  f"(prompt {len(bundle.instructions_for(start_role)):,} chars, cpu libre)")
         except Exception as exc:  # noqa: BLE001 — calentar nunca puede romper la llamada
             print(f"[WARM] llm warmup failed: {exc!r}")
 
     warm_task = asyncio.create_task(_warm_llm())
+
+    async def _loop_lag_watch() -> None:
+        """Mide si el bucle de eventos se queda bloqueado.
+
+        Si VAD y detector de turno saturan la CPU, asyncio no puede atender el socket
+        de Anthropic a tiempo y el ttft se infla aunque el token ya haya llegado.
+        Pedimos dormir 100 ms y medimos cuánto tardamos de más en despertar: ese
+        retraso ES el bloqueo. Solo imprimimos cuando empeora el récord, para no
+        llenar el log.
+        """
+        worst = 0.25
+        while True:
+            t0 = time.perf_counter()
+            await asyncio.sleep(0.1)
+            lag = time.perf_counter() - t0 - 0.1
+            if lag > worst:
+                worst = lag
+                print(f"[LAG] event loop bloqueado {lag:.2f}s")
+
+    lag_task = asyncio.create_task(_loop_lag_watch())
+
+    async def _stop_lag_watch() -> None:
+        lag_task.cancel()
+
+    ctx.add_shutdown_callback(_stop_lag_watch)
 
     await session.start(agent=agent, room=ctx.room)
 
@@ -1663,9 +1822,19 @@ async def entrypoint(ctx: JobContext) -> None:
     # hears Lander instantly, even if the first Anthropic completion is slow or times
     # out on a cold start. Covers name + AI disclosure + offer to help. The LLM only
     # kicks in from the caller's first reply onward (with client/recall context).
+    # OJO: en la demo `start_role` SIGUE siendo "recepcion" (ver `cribado_direct` arriba);
+    # a Cribado se entra por `RecepcionistaCribadoAgent`, no cambiando el rol. Mirar solo
+    # `start_role == "cribado"` dejaba la demo con el saludo genérico.
+    greeting = (
+        GREETING_TEXT_CRIBADO
+        if (cribado_direct or start_role == "cribado")
+        else GREETING_TEXT
+    )
+    print(f"[GREETING] cribado={cribado_direct or start_role == 'cribado'} "
+          f"start_role={start_role}")
     try:
         await session.say(
-            GREETING_TEXT.format(name=agent_name),
+            greeting.format(name=agent_name),
             allow_interruptions=True,
         )
     except Exception as exc:  # noqa: BLE001 — never let the greeting break the call
@@ -1682,8 +1851,13 @@ async def entrypoint(ctx: JobContext) -> None:
     # never delay or hijack the mandatory opening turn — that ordering broke calls once.
     # Fully guarded: if the audio player fails, the conversation continues unaffected.
     try:
+        # Sin thinking_sound. Se probó el teclado para tapar el hueco antes de que Lander
+        # hable y molesta: suena en CADA turno, justo antes de la voz, y el hueco real ya
+        # no es de 3s sino de ~1,9s, así que tapa poco y estorba mucho. El murmullo de
+        # oficina sí se queda: es continuo, no marca los turnos y da sensación de sala.
+        ambient_vol = float(os.getenv("AMBIENT_SOUND_VOLUME", "0.15"))
         background_audio = BackgroundAudioPlayer(
-            ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.15),
+            ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=ambient_vol),
         )
         await background_audio.start(room=ctx.room, agent_session=session)
     except Exception as exc:  # noqa: BLE001 — background audio is cosmetic, never fatal
