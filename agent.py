@@ -1589,7 +1589,15 @@ async def entrypoint(ctx: JobContext) -> None:
         f"cribado_direct={cribado_direct}"
     )
 
-    branch = "cribado" if cribado_direct else (start_role if standalone else None)
+    # El modo de ARRANQUE, no None. `branch` solo se reescribía en un handoff, así
+    # que una llamada que se quedaba en Recepción se guardaba con branch nulo y el
+    # registro no distinguía tres cosas distintas: la que nunca contestó, la que se
+    # quedó en triaje, y la que hizo el trabajo de cribado sin llamar a la tool.
+    # Esa tercera existe y está medida: la llamada de 13 turnos del 29-sep preguntó
+    # años de experiencia, sector y tamaño de equipo desde Recepción, porque el
+    # modelo puede hacer el guion sin pasar por `pasar_a_cribado`.
+    # Con esto, un branch nulo en la base ya solo puede ser un fallo de escritura.
+    branch = "cribado" if cribado_direct else (start_role if standalone else "recepcion")
     state = _CallState(standalone=standalone, branch=branch)
     bundle = _Bundle(
         base_prompt=base_prompt,
@@ -1686,6 +1694,11 @@ async def entrypoint(ctx: JobContext) -> None:
             print(f"[LANG] swap error: {exc!r}")
 
     # --- Call log: capture transcript + write one row on shutdown -------------
+    # El reloj arranca AQUI, antes del handler, porque `t` se mide contra él y un
+    # item puede llegar antes de que terminemos de montar el resto de la sesión.
+    started_mono = time.monotonic()
+    started_at = datetime.now(timezone.utc).isoformat()
+
     transcript: list[dict] = []
 
     @session.on("conversation_item_added")
@@ -1695,7 +1708,18 @@ async def entrypoint(ctx: JobContext) -> None:
             text = getattr(item, "text_content", None) or ""
             role = getattr(item, "role", "") or ""
             if text:
-                transcript.append({"role": str(role), "text": str(text)})
+                # `t` = segundos desde que empezó la llamada. Sin esto el registro
+                # dice QUÉ se dijo pero no CUÁNDO, así que no se puede demostrar
+                # ninguna latencia. Con él salen las dos cifras que importan:
+                # el `t` del primer turno del agente es el tiempo hasta la primera
+                # palabra (el arranque en frío), y la resta entre turnos seguidos
+                # es lo que el llamante espera tras hablar.
+                # Va dentro de `transcript`, que es jsonb, para no tocar el esquema.
+                transcript.append({
+                    "role": str(role),
+                    "text": str(text),
+                    "t": round(time.monotonic() - started_mono, 2),
+                })
         except Exception:  # noqa: BLE001 — never let logging break the call
             pass
 
@@ -1717,9 +1741,6 @@ async def entrypoint(ctx: JobContext) -> None:
                     {"kind": type(m).__name__, **fields}, separators=(",", ":")))
         except Exception:  # noqa: BLE001 — metrics are a nice-to-have, never break the call
             pass
-
-    started_mono = time.monotonic()
-    started_at = datetime.now(timezone.utc).isoformat()
 
     async def _write_call_log() -> None:
         # Browser test sessions (Probar Lander) run the full agent but must NOT pollute
