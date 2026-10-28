@@ -71,16 +71,22 @@ def get_product_info(topic: str) -> dict:
     if any(k in topic_l for k in ("integr", "tarda", "tiempo", "implant", "despliegue", "semana")):
         return {"found": True, "integracion": PRODUCT["integracion"]}
 
-    # Price is intentionally gated: never quote, Comercial closes it.
+    # Price. No number is public, but the agent IS the salesperson: role_ventas_es.md
+    # forbids deferring to "Comercial" or to "mi compañero". So this returns the
+    # policy it is allowed to say, not a refusal that pushes the caller to a human.
     if any(k in topic_l for k in ("precio", "coste", "cuánto", "cuanto", "tarifa", "plan", "presupuesto")):
-        return {
-            "found": False,
-            "reason": "price_not_public",
-            "say": (
-                "El precio depende del alcance y del volumen, así que eso lo cierra "
-                "mejor una persona del equipo comercial."
-            ),
-        }
+        if PRODUCT["precio"] == "PENDIENTE_DEFINIR":
+            return {
+                "found": True,
+                "precio_publico": False,
+                "say": (
+                    "No hay una tarifa cerrada: depende de vuestro volumen y de qué "
+                    "parte del ciclo automaticéis. Lo concretamos en la demo o en una "
+                    "propuesta que te preparo yo."
+                ),
+                "siguiente_paso": "Ofrecer agendar una demo con book_demo.",
+            }
+        return {"found": True, "precio_publico": True, "precio": PRODUCT["precio"]}
 
     # General macro pitch.
     return {
